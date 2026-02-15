@@ -552,13 +552,25 @@ const DevnetMintContent: FC = () => {
                 </div>
 
                 <div className="mt-3 p-3 border border-[var(--border)] bg-[var(--bg-elevated)]">
-                  <p className="text-[10px] text-[var(--text-secondary)]">
-                    💡 <strong>Pro tip:</strong> After creating your market, you can upload a custom logo at{" "}
-                    <Link href="/upload-logo" className="text-[var(--accent)] hover:underline">
-                      /upload-logo
-                    </Link>
-                    {" "}to make it stand out on the markets list and trade page!
+                  <p className="text-[10px] text-[var(--text-secondary)] mb-2">
+                    💡 <strong>Pro tip:</strong> Make your token visible in wallets and explorers!
                   </p>
+                  <ul className="text-[10px] text-[var(--text-secondary)] space-y-1 ml-4 list-disc">
+                    <li>
+                      Upload a logo at{" "}
+                      <Link href="/upload-logo" className="text-[var(--accent)] hover:underline">
+                        /upload-logo
+                      </Link>
+                      {" "}for markets
+                    </li>
+                    <li>
+                      Update token metadata at{" "}
+                      <Link href={`/update-token-metadata?mint=${mintAddress}`} className="text-[var(--accent)] hover:underline">
+                        /update-token-metadata
+                      </Link>
+                      {" "}to show logo in Phantom wallet & Solana Explorer
+                    </li>
+                  </ul>
                 </div>
 
                 <button onClick={() => { setMintAddress(null); setCreateStatus(null); setLastTxSig(null); }} className="mt-4 text-xs text-[var(--text-dim)] hover:text-[var(--text-muted)] underline">
