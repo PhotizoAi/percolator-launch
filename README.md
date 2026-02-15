@@ -622,7 +622,19 @@ Grid background overlay, noise texture, glass-morphism panels. No emojis in data
 
 ## Documentation
 
-Detailed docs live in the [`docs/`](./docs/) directory:
+### Architecture & Development
+
+For developers and contributors:
+
+| Document | Description |
+|----------|-------------|
+| **[`ARCHITECTURE.md`](./ARCHITECTURE.md)** | **Complete architecture overview and system design** |
+| **[`FEATURE_DEVELOPMENT_GUIDE.md`](./FEATURE_DEVELOPMENT_GUIDE.md)** | **Quick-start guide for adding new features** |
+| [`CONTRIBUTING-AGENTS.md`](./CONTRIBUTING-AGENTS.md) | AI agent contribution guide |
+
+### Detailed Specifications
+
+Technical specs live in the [`docs/`](./docs/) directory:
 
 | Document | Description |
 |----------|-------------|
@@ -631,7 +643,11 @@ Detailed docs live in the [`docs/`](./docs/) directory:
 | [`MAINNET-READINESS.md`](./docs/MAINNET-READINESS.md) | Mainnet deployment checklist |
 | [`MAINNET-ROADMAP.md`](./docs/MAINNET-ROADMAP.md) | Full roadmap to mainnet |
 | [`MIDTERM-COMPARISON.md`](./docs/MIDTERM-COMPARISON.md) | Feature comparison with MidTermDev's implementation |
-| [`CONTRIBUTING-AGENTS.md`](./CONTRIBUTING-AGENTS.md) | AI agent contribution guide |
+
+### Audit Reports
+
+| Document | Description |
+|----------|-------------|
 | [`AUDIT-TRADE.md`](./AUDIT-TRADE.md) | Trade system audit (23 findings, all resolved) |
 | [`AUDIT-PAGES.md`](./AUDIT-PAGES.md) | Frontend pages audit (34 findings, all resolved) |
 | [`AUDIT-BACKEND.md`](./AUDIT-BACKEND.md) | Backend audit (15 findings, all resolved) |
