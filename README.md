@@ -285,6 +285,16 @@ Multi-source median pricing with 30% max deviation protection and 5-minute stale
 - **Reset risk gates** — Clear risk-reduction-only mode when markets get stuck
 - **Renounce admin** — Irreversibly burn admin keys (makes market fully permissionless)
 - **Top up insurance** — Add funds to insurance vault
+- **Upload market logos** — Add custom logos to markets for better visual branding
+
+### Market Customization
+- **Logo Upload** — Add custom logos to your markets via `/upload-logo` page
+  - Supports PNG, JPG, GIF, WEBP, SVG (max 5MB)
+  - Drag & drop or click to upload
+  - Displays on markets list and trade page
+  - Falls back to symbol initial when no logo provided
+  - Stored in Supabase Storage for fast loading
+- **Branding** — Make your markets stand out with visual identity
 
 ### Insurance LP
 - On-chain deposit/withdraw with SPL claim tokens
