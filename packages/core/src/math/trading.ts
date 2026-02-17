@@ -47,7 +47,9 @@ export function computeLiqPrice(
     return liq > 0n ? liq : 0n;
   } else {
     // Guard: if maintenanceMarginBps >= 10000 (100%), position is effectively unliquidatable
-    if (maintenanceMarginBps >= 10000n) return entryPrice;
+    // Short positions liquidate when price rises. With >= 100% margin, they have enough
+    // collateral to cover any price increase, so return max u64 to indicate "never liquidated"
+    if (maintenanceMarginBps >= 10000n) return 18446744073709551615n; // max u64
     const adjusted = (capitalPerUnitE6 * 10000n) / (10000n - maintenanceMarginBps);
     return entryPrice + adjusted;
   }
