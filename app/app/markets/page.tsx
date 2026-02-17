@@ -159,7 +159,9 @@ function MarketsPageInner() {
   const tokenMetaMap = useMultiTokenMeta(allMints);
 
   const filtered = useMemo(() => {
-    let list = effectiveMarkets;
+    // Exclude markets with invalid leverage (0 or negative) from all filters
+    let list = effectiveMarkets.filter((m) => m.maxLeverage > 0);
+    
     // Text search — matches on-chain symbol, name, slab address, OR mint address
     if (debouncedSearch.trim()) {
       const q = debouncedSearch.toLowerCase();
