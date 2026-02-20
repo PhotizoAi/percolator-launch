@@ -173,15 +173,19 @@ function MarketsPageInner() {
     }
     // Leverage filter
     if (leverageFilter !== "all") {
-      const maxLev = parseInt(leverageFilter);
-      list = list.filter((m) => m.maxLeverage >= maxLev);
-    }
-    // Oracle filter
-    if (oracleFilter === "admin") {
-      list = list.filter((m) => m.isAdminOracle);
-    } else if (oracleFilter === "live") {
-      list = list.filter((m) => !m.isAdminOracle);
-    }
+          const minLev =
+      leverageFilter === "all"
+        ? null
+        : (() => {
+            const match = /^(\d+)x$/i.exec(leverageFilter.trim());
+            return match ? Number(match[1]) : null;
+          })();
+
+    if (minLev != null) {
+      list = list.filter(
+        (m) => Number.isFinite(m.maxLeverage) && m.maxLeverage >= minLev
+      );
+          }
     list = [...list].sort((a, b) => {
       switch (sortBy) {
         case "volume": 
