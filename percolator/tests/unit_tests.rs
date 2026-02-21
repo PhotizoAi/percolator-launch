@@ -4568,3 +4568,104 @@ fn test_rounding_bound_with_many_positive_pnl_accounts() {
         MAX_ROUNDING_SLACK
     );
 }
+
+// ==============================================================================
+// PARAM VALIDATION TESTS (init_in_place / set_margin_params)
+// ==============================================================================
+
+fn make_params_with(
+    initial_margin_bps: u64,
+    maintenance_margin_bps: u64,
+    max_accounts: u64,
+) -> RiskParams {
+    let mut p = default_params();
+    p.initial_margin_bps = initial_margin_bps;
+    p.maintenance_margin_bps = maintenance_margin_bps;
+    p.max_accounts = max_accounts;
+    p
+}
+
+#[test]
+fn test_init_in_place_valid_params() {
+    let mut engine = Box::new(RiskEngine::new(default_params()));
+    // Use a max_accounts that fits within the compile-time slab size.
+    let mut params = default_params();
+    params.max_accounts = MAX_ACCOUNTS as u64;
+    let result = engine.init_in_place(params);
+    assert_eq!(result, Ok(()));
+}
+
+#[test]
+fn test_init_in_place_zero_maintenance_margin() {
+    let mut engine = Box::new(RiskEngine::new(default_params()));
+    let params = make_params_with(1000, 0, 64);
+    assert_eq!(engine.init_in_place(params), Err(RiskError::InvalidParams));
+}
+
+#[test]
+fn test_init_in_place_initial_below_maintenance() {
+    let mut engine = Box::new(RiskEngine::new(default_params()));
+    // initial (300 bps) < maintenance (500 bps) — invalid
+    let params = make_params_with(300, 500, 64);
+    assert_eq!(engine.init_in_place(params), Err(RiskError::InvalidParams));
+}
+
+#[test]
+fn test_init_in_place_maintenance_exceeds_100_pct() {
+    let mut engine = Box::new(RiskEngine::new(default_params()));
+    let params = make_params_with(11_000, 11_000, 64);
+    assert_eq!(engine.init_in_place(params), Err(RiskError::InvalidParams));
+}
+
+#[test]
+fn test_init_in_place_initial_exceeds_100_pct() {
+    let mut engine = Box::new(RiskEngine::new(default_params()));
+    // maintenance ok but initial > 100%
+    let params = make_params_with(11_000, 500, 64);
+    assert_eq!(engine.init_in_place(params), Err(RiskError::InvalidParams));
+}
+
+#[test]
+fn test_init_in_place_zero_max_accounts() {
+    let mut engine = Box::new(RiskEngine::new(default_params()));
+    let params = make_params_with(1000, 500, 0);
+    assert_eq!(engine.init_in_place(params), Err(RiskError::InvalidParams));
+}
+
+#[test]
+fn test_init_in_place_max_accounts_exceeds_slab() {
+    let mut engine = Box::new(RiskEngine::new(default_params()));
+    let params = make_params_with(1000, 500, MAX_ACCOUNTS as u64 + 1);
+    assert_eq!(engine.init_in_place(params), Err(RiskError::InvalidParams));
+}
+
+#[test]
+fn test_set_margin_params_valid() {
+    let mut engine = Box::new(RiskEngine::new(default_params()));
+    // initial == maintenance is a valid (albeit conservative) configuration
+    assert_eq!(engine.set_margin_params(500, 500), Ok(()));
+    assert_eq!(engine.params.initial_margin_bps, 500);
+    assert_eq!(engine.params.maintenance_margin_bps, 500);
+}
+
+#[test]
+fn test_set_margin_params_initial_below_maintenance() {
+    let mut engine = Box::new(RiskEngine::new(default_params()));
+    assert_eq!(engine.set_margin_params(300, 500), Err(RiskError::InvalidParams));
+    // Params must remain unchanged after rejection
+    assert_eq!(engine.params.initial_margin_bps, default_params().initial_margin_bps);
+    assert_eq!(engine.params.maintenance_margin_bps, default_params().maintenance_margin_bps);
+}
+
+#[test]
+fn test_set_margin_params_zero_maintenance() {
+    let mut engine = Box::new(RiskEngine::new(default_params()));
+    assert_eq!(engine.set_margin_params(1000, 0), Err(RiskError::InvalidParams));
+}
+
+#[test]
+fn test_set_margin_params_exceeds_100_pct() {
+    let mut engine = Box::new(RiskEngine::new(default_params()));
+    assert_eq!(engine.set_margin_params(10_001, 500), Err(RiskError::InvalidParams));
+    assert_eq!(engine.set_margin_params(1000, 10_001), Err(RiskError::InvalidParams));
+}

@@ -293,6 +293,34 @@ pub struct RiskParams {
     pub min_liquidation_abs: U128,
 }
 
+impl RiskParams {
+    /// Validate that the parameters are internally consistent and within safe bounds.
+    ///
+    /// # Invariants checked
+    /// - `maintenance_margin_bps` must be > 0 and <= 10_000 (0–100%)
+    /// - `initial_margin_bps` must be >= `maintenance_margin_bps` and <= 10_000
+    /// - `max_accounts` must be > 0 and <= `MAX_ACCOUNTS`
+    pub fn validate(&self) -> Result<()> {
+        // Maintenance margin must be non-zero (otherwise liquidations never trigger)
+        // and cannot exceed 100%.
+        if self.maintenance_margin_bps == 0 || self.maintenance_margin_bps > 10_000 {
+            return Err(RiskError::InvalidParams);
+        }
+        // Initial margin must be >= maintenance margin (you cannot open a position
+        // that is already below maintenance) and cannot exceed 100%.
+        if self.initial_margin_bps < self.maintenance_margin_bps
+            || self.initial_margin_bps > 10_000
+        {
+            return Err(RiskError::InvalidParams);
+        }
+        // At least one account must be allowed; hard cap is the compile-time slab size.
+        if self.max_accounts == 0 || self.max_accounts > MAX_ACCOUNTS as u64 {
+            return Err(RiskError::InvalidParams);
+        }
+        Ok(())
+    }
+}
+
 /// Main risk engine state - fixed slab with bitmap
 #[repr(C)]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -453,6 +481,9 @@ pub enum RiskError {
 
     /// Account kind mismatch
     AccountKindMismatch,
+
+    /// Invalid risk parameters (e.g., zero maintenance margin, initial < maintenance)
+    InvalidParams,
 }
 
 pub type Result<T> = core::result::Result<T, RiskError>;
@@ -698,7 +729,11 @@ impl RiskEngine {
     ///
     /// This is the correct way to initialize RiskEngine in Solana BPF programs
     /// where stack space is limited to 4KB.
-    pub fn init_in_place(&mut self, params: RiskParams) {
+    ///
+    /// Returns `Err(InvalidParams)` if `params` fail validation (see `RiskParams::validate`).
+    pub fn init_in_place(&mut self, params: RiskParams) -> Result<()> {
+        params.validate()?;
+
         // Set params (non-zero field)
         self.params = params;
         self.max_crank_staleness_slots = params.max_crank_staleness_slots;
@@ -713,6 +748,7 @@ impl RiskEngine {
             self.next_free[i] = (i + 1) as u16;
         }
         self.next_free[MAX_ACCOUNTS - 1] = u16::MAX; // Sentinel
+        Ok(())
     }
 
     // ========================================
@@ -1284,9 +1320,23 @@ impl RiskEngine {
     }
 
     /// Update initial and maintenance margin BPS. Admin only.
-    pub fn set_margin_params(&mut self, initial_margin_bps: u64, maintenance_margin_bps: u64) {
+    ///
+    /// Returns `Err(InvalidParams)` if `initial_margin_bps < maintenance_margin_bps`,
+    /// either value is zero, or either value exceeds 10_000 (100%).
+    pub fn set_margin_params(
+        &mut self,
+        initial_margin_bps: u64,
+        maintenance_margin_bps: u64,
+    ) -> Result<()> {
+        if maintenance_margin_bps == 0 || maintenance_margin_bps > 10_000 {
+            return Err(RiskError::InvalidParams);
+        }
+        if initial_margin_bps < maintenance_margin_bps || initial_margin_bps > 10_000 {
+            return Err(RiskError::InvalidParams);
+        }
         self.params.initial_margin_bps = initial_margin_bps;
         self.params.maintenance_margin_bps = maintenance_margin_bps;
+        Ok(())
     }
 
     /// Close an account and return its capital to the caller.

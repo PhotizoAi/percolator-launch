@@ -1021,6 +1021,8 @@ pub mod error {
         InsuranceSupplyMismatch,
         /// Market is paused — trading, deposits, and withdrawals are disabled
         MarketPaused,
+        /// Engine rejected parameters as invalid
+        EngineInvalidParams,
     }
 
     impl From<PercolatorError> for ProgramError {
@@ -1041,6 +1043,7 @@ pub mod error {
             RiskError::NotAnLPAccount => PercolatorError::EngineNotAnLPAccount,
             RiskError::PositionSizeMismatch => PercolatorError::EnginePositionSizeMismatch,
             RiskError::AccountKindMismatch => PercolatorError::EngineAccountKindMismatch,
+            RiskError::InvalidParams => PercolatorError::EngineInvalidParams,
         };
         ProgramError::Custom(err as u32)
     }
@@ -3132,7 +3135,7 @@ pub mod processor {
                 // Initialize engine in-place (zero-copy) to avoid stack overflow.
                 // The data is already zeroed above, so init_in_place only sets non-zero fields.
                 let engine = zc::engine_mut(&mut data)?;
-                engine.init_in_place(risk_params);
+                engine.init_in_place(risk_params).map_err(map_risk_error)?;
 
                 // Initialize slot fields to current slot to prevent overflow on first crank
                 // (accrue_funding checks dt < 31_536_000, which fails if last_funding_slot=0)
@@ -4633,7 +4636,7 @@ pub mod processor {
                 }
 
                 let engine = zc::engine_mut(&mut data)?;
-                engine.set_margin_params(initial_margin_bps, maintenance_margin_bps);
+                engine.set_margin_params(initial_margin_bps, maintenance_margin_bps).map_err(map_risk_error)?;
 
                 // Update trading fee if provided (backwards compatible)
                 if let Some(fee) = trading_fee_bps {
