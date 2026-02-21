@@ -4568,3 +4568,46 @@ fn test_rounding_bound_with_many_positive_pnl_accounts() {
         MAX_ROUNDING_SLACK
     );
 }
+
+// ==============================================================================
+// admin_force_close — bounds / existence guard tests
+// ==============================================================================
+
+/// admin_force_close with an out-of-bounds index must return AccountNotFound,
+/// not panic.
+#[test]
+fn test_admin_force_close_oob_index_returns_error() {
+    let mut engine = Box::new(RiskEngine::new(default_params()));
+    let oob: u16 = MAX_ACCOUNTS as u16; // exactly one past the end
+    let result = engine.admin_force_close(oob, 1, 1_000_000);
+    assert!(
+        matches!(result, Err(RiskError::AccountNotFound)),
+        "Expected AccountNotFound for OOB index, got {:?}",
+        result
+    );
+}
+
+/// admin_force_close on an index that is in-range but never initialised must
+/// return AccountNotFound, not index into uninitialised memory.
+#[test]
+fn test_admin_force_close_unused_slot_returns_error() {
+    let mut engine = Box::new(RiskEngine::new(default_params()));
+    // Slot 0 was never opened — is_used(0) == false
+    let result = engine.admin_force_close(0, 1, 1_000_000);
+    assert!(
+        matches!(result, Err(RiskError::AccountNotFound)),
+        "Expected AccountNotFound for unused slot, got {:?}",
+        result
+    );
+}
+
+/// admin_force_close on a valid account with a zero position must succeed (no-op).
+#[test]
+fn test_admin_force_close_zero_position_is_noop() {
+    let mut engine = Box::new(RiskEngine::new(default_params()));
+    let user = engine.add_user(0).unwrap();
+    engine.deposit(user, 1_000_000, 0).unwrap();
+    // Position is zero — should return Ok without touching anything
+    let result = engine.admin_force_close(user, 1, 1_000_000);
+    assert!(result.is_ok(), "Expected Ok for zero-position account, got {:?}", result);
+}
