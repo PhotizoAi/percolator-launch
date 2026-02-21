@@ -1091,9 +1091,9 @@ impl RiskEngine {
         // Deduct from fee_credits (coupon: no insurance booking here —
         // insurance was already paid when credits were granted)
         self.accounts[idx as usize].fee_credits =
-            self.accounts[idx as usize].fee_credits.saturating_sub(due as i128);
-
-        // If fee_credits is negative, pay from capital using set_capital helper (spec §4.1)
+            self.accounts[idx as usize].fee_credits.saturating_sub(
+                core::cmp::min(due, i128::MAX as u128) as i128,
+            );
         let mut paid_from_capital = 0u128;
         if self.accounts[idx as usize].fee_credits.is_negative() {
             let owed = neg_i128_to_u128(self.accounts[idx as usize].fee_credits.get());
@@ -1153,7 +1153,9 @@ impl RiskEngine {
         // Deduct from fee_credits (coupon: no insurance booking here —
         // insurance was already paid when credits were granted)
         self.accounts[idx as usize].fee_credits =
-            self.accounts[idx as usize].fee_credits.saturating_sub(due as i128);
+            self.accounts[idx as usize].fee_credits.saturating_sub(
+                core::cmp::min(due, i128::MAX as u128) as i128,
+            );
 
         // If negative, pay what we can from capital using set_capital helper (spec §4.1)
         let mut paid_from_capital = 0u128;
@@ -1259,6 +1261,10 @@ impl RiskEngine {
         if idx as usize >= MAX_ACCOUNTS || !self.is_used(idx as usize) {
             return Err(RiskError::Unauthorized);
         }
+        // Guard: amount must fit in i128 so the fee_credits credit doesn't wrap to negative.
+        if amount > i128::MAX as u128 {
+            return Err(RiskError::Overflow);
+        }
         self.current_slot = now_slot;
 
         // Wrapper transferred tokens into vault
@@ -1270,7 +1276,7 @@ impl RiskEngine {
         self.insurance_fund.balance = self.insurance_fund.balance + amount;
         self.insurance_fund.fee_revenue = self.insurance_fund.fee_revenue + amount;
 
-        // Credit the account
+        // Credit the account (safe: amount <= i128::MAX guaranteed above)
         self.accounts[idx as usize].fee_credits = self.accounts[idx as usize]
             .fee_credits
             .saturating_add(amount as i128);
@@ -1309,6 +1315,9 @@ impl RiskEngine {
     /// Settles mark PnL first, then closes position.
     pub fn admin_force_close(&mut self, idx: u16, now_slot: u64, oracle_price: u64) -> Result<()> {
         self.current_slot = now_slot;
+        if idx as usize >= MAX_ACCOUNTS || !self.is_used(idx as usize) {
+            return Err(RiskError::AccountNotFound);
+        }
         if self.accounts[idx as usize].position_size.is_zero() {
             return Ok(());
         }
@@ -2489,7 +2498,9 @@ impl RiskEngine {
 
             // Deduct from fee_credits (coupon: no insurance booking here —
             // insurance was already paid when credits were granted)
-            account.fee_credits = account.fee_credits.saturating_sub(due as i128);
+            account.fee_credits = account.fee_credits.saturating_sub(
+                core::cmp::min(due, i128::MAX as u128) as i128,
+            );
         }
 
         // Pay any owed fees from deposit first

@@ -4669,3 +4669,105 @@ fn test_set_margin_params_exceeds_100_pct() {
     assert_eq!(engine.set_margin_params(10_001, 500), Err(RiskError::InvalidParams));
     assert_eq!(engine.set_margin_params(1000, 10_001), Err(RiskError::InvalidParams));
 }
+
+// ==============================================================================
+// BUG FIX TESTS: admin_force_close, deposit_fee_credits, due-as-i128 overflow
+// ==============================================================================
+
+/// Bug 1 – admin_force_close must return AccountNotFound for out-of-bounds or unused idx.
+#[test]
+fn test_admin_force_close_invalid_idx_returns_account_not_found() {
+    let mut engine = Box::new(RiskEngine::new(default_params()));
+
+    // An idx that is out of the slab entirely
+    let oob_idx = MAX_ACCOUNTS as u16; // equals MAX_ACCOUNTS, so >= MAX_ACCOUNTS
+    assert_eq!(
+        engine.admin_force_close(oob_idx, 0, DEFAULT_ORACLE),
+        Err(RiskError::AccountNotFound),
+        "out-of-bounds idx must return AccountNotFound"
+    );
+
+    // An idx that is in range but the slot is not allocated
+    // Slot 0 was never allocated, so it should be unused.
+    assert_eq!(
+        engine.admin_force_close(0, 0, DEFAULT_ORACLE),
+        Err(RiskError::AccountNotFound),
+        "unused slot must return AccountNotFound"
+    );
+}
+
+/// Bug 1 – admin_force_close must work normally for a valid allocated account.
+#[test]
+fn test_admin_force_close_valid_account_closes_position() {
+    let mut engine = Box::new(RiskEngine::new(default_params()));
+
+    let lp_idx = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
+    let user_idx = engine.add_user(0).unwrap();
+
+    engine.deposit(lp_idx, 1_000_000, 0).unwrap();
+    engine.deposit(user_idx, 1_000_000, 0).unwrap();
+
+    // Open a position for the user via a trade
+    engine
+        .execute_trade(&MATCHER, lp_idx, user_idx, 0, DEFAULT_ORACLE, 100)
+        .unwrap();
+    assert!(!engine.accounts[user_idx as usize].position_size.is_zero());
+
+    // Admin force-close must succeed and zero out the position
+    engine.admin_force_close(user_idx, 0, DEFAULT_ORACLE).unwrap();
+    assert!(engine.accounts[user_idx as usize].position_size.is_zero());
+}
+
+/// Bug 2 – deposit_fee_credits must reject amount > i128::MAX to prevent
+/// fee_credits wrapping to negative (tokens locked forever).
+#[test]
+fn test_deposit_fee_credits_overflow_rejected() {
+    let mut engine = Box::new(RiskEngine::new(default_params()));
+    let user_idx = engine.add_user(0).unwrap();
+
+    // Amount one step above i128::MAX: as i128 this wraps to i128::MIN (negative).
+    let above_i128_max: u128 = i128::MAX as u128 + 1;
+    assert_eq!(
+        engine.deposit_fee_credits(user_idx, above_i128_max, 0),
+        Err(RiskError::Overflow),
+        "amount > i128::MAX must be rejected"
+    );
+
+    // i128::MAX itself must be accepted without error.
+    // (We can't actually transfer tokens in unit tests, but the engine must not error.)
+    assert!(engine.deposit_fee_credits(user_idx, i128::MAX as u128, 0).is_ok());
+    assert_eq!(
+        engine.accounts[user_idx as usize].fee_credits.get(),
+        i128::MAX,
+        "valid deposit must increase fee_credits by the exact amount"
+    );
+}
+
+/// Bug 3 – an extreme maintenance_fee_per_slot must never flip fee_credits positive.
+/// With maintenance_fee_per_slot = u128::MAX, any `due as i128` would wrap to -1,
+/// making `saturating_sub(-1)` add to fee_credits instead of subtracting.
+/// After the clamp fix, the fee_credits must go DOWN (or to i128::MIN at worst).
+#[test]
+fn test_settle_maintenance_fee_extreme_fee_does_not_increase_fee_credits() {
+    let mut params = default_params();
+    // Set an absurdly large maintenance fee per slot
+    params.maintenance_fee_per_slot = U128::new(u128::MAX);
+    let mut engine = Box::new(RiskEngine::new(params));
+
+    let user_idx = engine.add_user(0).unwrap();
+    // Give the user some fee credits so we can observe the direction of change
+    engine.add_fee_credits(user_idx, 1_000_000).unwrap();
+    let credits_before = engine.accounts[user_idx as usize].fee_credits.get();
+
+    // Settle fees after 1 slot.
+    // due = maintenance_fee_per_slot (u128::MAX) * dt (1) = u128::MAX, clamped to i128::MAX before cast.
+    let _ = engine.settle_maintenance_fee(user_idx, 1, DEFAULT_ORACLE);
+
+    let credits_after = engine.accounts[user_idx as usize].fee_credits.get();
+    assert!(
+        credits_after <= credits_before,
+        "fee settlement must never increase fee_credits (before={}, after={})",
+        credits_before,
+        credits_after
+    );
+}
