@@ -1105,9 +1105,14 @@ impl RiskEngine {
             self.insurance_fund.balance = self.insurance_fund.balance + pay;
             self.insurance_fund.fee_revenue = self.insurance_fund.fee_revenue + pay;
 
-            // Credit back what was paid
+            // Credit back what was paid.
+            // Clamp pay to i128::MAX before cast: if fee_credits == i128::MIN, owed ==
+            // i128::MAX+1 which wraps as i128, making saturating_add a no-op and
+            // permanently preventing debt clearance.  With the clamp, fee_credits moves
+            // from i128::MIN to -1 on this call and clears fully on the next.
             self.accounts[idx as usize].fee_credits =
-                self.accounts[idx as usize].fee_credits.saturating_add(pay as i128);
+                self.accounts[idx as usize].fee_credits
+                    .saturating_add(core::cmp::min(pay, i128::MAX as u128) as i128);
             paid_from_capital = pay;
         }
 
@@ -1169,8 +1174,10 @@ impl RiskEngine {
             self.insurance_fund.balance = self.insurance_fund.balance + pay;
             self.insurance_fund.fee_revenue = self.insurance_fund.fee_revenue + pay;
 
+            // Clamp pay to i128::MAX before cast (see settle_maintenance_fee for rationale).
             self.accounts[idx as usize].fee_credits =
-                self.accounts[idx as usize].fee_credits.saturating_add(pay as i128);
+                self.accounts[idx as usize].fee_credits
+                    .saturating_add(core::cmp::min(pay, i128::MAX as u128) as i128);
             paid_from_capital = pay;
         }
 
@@ -1201,8 +1208,10 @@ impl RiskEngine {
                 self.set_capital(idx as usize, current_cap.saturating_sub(pay));
                 self.insurance_fund.balance = self.insurance_fund.balance + pay;
                 self.insurance_fund.fee_revenue = self.insurance_fund.fee_revenue + pay;
+                // Clamp pay to i128::MAX before cast (see settle_maintenance_fee for rationale).
                 self.accounts[idx as usize].fee_credits =
-                    self.accounts[idx as usize].fee_credits.saturating_add(pay as i128);
+                    self.accounts[idx as usize].fee_credits
+                        .saturating_add(core::cmp::min(pay, i128::MAX as u128) as i128);
             }
         }
     }
@@ -2512,8 +2521,10 @@ impl RiskEngine {
             self.insurance_fund.balance = self.insurance_fund.balance + pay;
             self.insurance_fund.fee_revenue = self.insurance_fund.fee_revenue + pay;
 
-            // Credit back what was paid
-            account.fee_credits = account.fee_credits.saturating_add(pay as i128);
+            // Credit back what was paid.
+            // Clamp pay to i128::MAX before cast (see settle_maintenance_fee for rationale).
+            account.fee_credits = account.fee_credits
+                .saturating_add(core::cmp::min(pay, i128::MAX as u128) as i128);
         }
 
         // Vault gets full deposit (tokens received)

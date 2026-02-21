@@ -4771,3 +4771,153 @@ fn test_settle_maintenance_fee_extreme_fee_does_not_increase_fee_credits() {
         credits_after
     );
 }
+
+// ==============================================================================
+// BUG E – `pay as i128` overflow in fee-credit settlement (4 paths)
+// ==============================================================================
+//
+// When fee_credits == i128::MIN, neg_i128_to_u128 returns i128::MAX + 1.
+// If capital >= i128::MAX + 1, pay == i128::MAX + 1 and the bare `pay as i128`
+// cast wraps to i128::MIN, making `saturating_add(i128::MIN)` a no-op.  The
+// debt is never cleared and capital gets drained on every subsequent call.
+//
+// The fix clamps `pay` to i128::MAX before the cast so the debt moves from
+// i128::MIN → -1 on the first call and fully clears on the second.
+
+/// Force fee_credits to exactly i128::MIN on a valid account (test helper).
+fn force_fee_credits_to_min(engine: &mut RiskEngine, idx: u16) {
+    // Two rounds of max-possible deduction drives fee_credits from 0 to i128::MIN:
+    //   round 1: 0 - i128::MAX = -i128::MAX
+    //   round 2: -i128::MAX - i128::MAX saturates to i128::MIN
+    // We use the internal accounts field directly (test-only direct mutation).
+    engine.accounts[idx as usize].fee_credits = I128::new(i128::MIN);
+}
+
+/// Force capital to a value that exceeds i128::MAX (test helper).
+/// We manipulate vault and c_tot consistently with the engine's invariants.
+fn force_large_capital(engine: &mut RiskEngine, idx: u16, amount: u128) {
+    // Adjust vault and c_tot to remain consistent, then set capital directly.
+    let old_cap = engine.accounts[idx as usize].capital.get();
+    engine.vault = U128::new(engine.vault.get().saturating_add(amount).saturating_sub(old_cap));
+    engine.c_tot = U128::new(engine.c_tot.get().saturating_add(amount).saturating_sub(old_cap));
+    engine.accounts[idx as usize].capital = U128::new(amount);
+}
+
+/// settle_maintenance_fee: pay as i128 must not overflow when fee_credits == i128::MIN
+/// and capital is very large.
+#[test]
+fn test_settle_maintenance_fee_pay_cast_clamp() {
+    let mut engine = Box::new(RiskEngine::new(default_params()));
+    let user_idx = engine.add_user(0).unwrap();
+
+    force_fee_credits_to_min(&mut engine, user_idx);
+    // Capital larger than i128::MAX triggers the wrap path
+    let huge_capital: u128 = i128::MAX as u128 + 2;
+    force_large_capital(&mut engine, user_idx, huge_capital);
+
+    let credits_before = engine.accounts[user_idx as usize].fee_credits.get();
+    assert_eq!(credits_before, i128::MIN);
+
+    // Trigger pay-from-capital path — maintenance fee already accrued (we set fee_credits directly)
+    // Call settle_maintenance_fee; dt = 0 so no new `due` deduction, but fee_credits is already
+    // negative so the pay-from-capital block runs.  We must fake dt > 0 by advancing last_fee_slot.
+    engine.accounts[user_idx as usize].last_fee_slot = 1; // was 0, so dt = 0 - 1 wraps; use now_slot > last
+    let _ = engine.settle_maintenance_fee(user_idx, 2, DEFAULT_ORACLE); // dt = 1, due = 0 (fee_per_slot=0)
+
+    let credits_after = engine.accounts[user_idx as usize].fee_credits.get();
+    // After the fix: credits should have moved towards 0 (must be > i128::MIN)
+    assert!(
+        credits_after > credits_before,
+        "pay as i128 wrap bug: fee_credits must increase after paying debt \
+         (before={}, after={})",
+        credits_before,
+        credits_after
+    );
+}
+
+/// settle_maintenance_fee_best_effort (called inside keeper_crank): same invariant.
+#[test]
+fn test_fee_best_effort_pay_cast_clamp() {
+    let mut engine = Box::new(RiskEngine::new(default_params()));
+    let user_idx = engine.add_user(0).unwrap();
+
+    force_fee_credits_to_min(&mut engine, user_idx);
+    force_large_capital(&mut engine, user_idx, i128::MAX as u128 + 2);
+
+    engine.accounts[user_idx as usize].last_fee_slot = 1;
+    // settle_maintenance_fee_best_effort_for_crank is private; drive it via keeper_crank
+    // by making user_idx the caller_idx with dt > 0.
+    let mut params = default_params();
+    params.max_accounts = MAX_ACCOUNTS as u64;
+    let mut engine2 = Box::new(RiskEngine::new(params));
+    let idx2 = engine2.add_user(0).unwrap();
+    force_fee_credits_to_min(&mut engine2, idx2);
+    force_large_capital(&mut engine2, idx2, i128::MAX as u128 + 2);
+    engine2.accounts[idx2 as usize].last_fee_slot = 1;
+    // Reset crank state to allow the call
+    engine2.last_crank_slot = 0;
+    engine2.last_full_sweep_start_slot = 0;
+    engine2.last_full_sweep_completed_slot = 0;
+
+    // Drive via keeper_crank which calls settle_maintenance_fee_best_effort_for_crank on caller
+    let _ = engine2.keeper_crank(idx2, 2, DEFAULT_ORACLE, 0, false);
+
+    let credits = engine2.accounts[idx2 as usize].fee_credits.get();
+    assert!(
+        credits > i128::MIN,
+        "best-effort pay as i128 wrap bug: fee_credits must move above i128::MIN \
+         (got {})",
+        credits
+    );
+}
+
+/// pay_fee_debt_from_capital: same invariant.
+#[test]
+fn test_pay_fee_debt_from_capital_cast_clamp() {
+    let mut engine = Box::new(RiskEngine::new(default_params()));
+    let user_idx = engine.add_user(0).unwrap();
+
+    force_fee_credits_to_min(&mut engine, user_idx);
+    force_large_capital(&mut engine, user_idx, i128::MAX as u128 + 2);
+
+    // Deposit 0 triggers settle_warmup_to_capital then pay_fee_debt_from_capital
+    let credits_before = engine.accounts[user_idx as usize].fee_credits.get();
+    engine.deposit(user_idx, 0, 0).unwrap();
+
+    let credits_after = engine.accounts[user_idx as usize].fee_credits.get();
+    assert!(
+        credits_after > credits_before,
+        "pay_fee_debt_from_capital: pay as i128 wrap must be fixed \
+         (before={}, after={})",
+        credits_before,
+        credits_after
+    );
+}
+
+/// deposit path fee clearance: same invariant (fee paid from deposit_remaining).
+#[test]
+fn test_deposit_fee_credit_pay_cast_clamp() {
+    let mut engine = Box::new(RiskEngine::new(default_params()));
+    let user_idx = engine.add_user(0).unwrap();
+
+    force_fee_credits_to_min(&mut engine, user_idx);
+    // Capital is irrelevant here — the fee is paid from `deposit_remaining`
+    // which comes from the deposit amount.  Use a deposit >= i128::MAX + 1.
+    let deposit_amount: u128 = i128::MAX as u128 + 2;
+    // We need the vault to be big enough to accommodate the deposit check.
+    engine.vault = U128::new(deposit_amount.saturating_add(1));
+
+    let credits_before = engine.accounts[user_idx as usize].fee_credits.get();
+    // deposit() checks the account exists and adds to vault; the fee deduction
+    // from deposit_remaining goes through the `pay as i128` cast path.
+    engine.deposit(user_idx, deposit_amount, 0).unwrap();
+
+    let credits_after = engine.accounts[user_idx as usize].fee_credits.get();
+    assert!(
+        credits_after > credits_before,
+        "deposit fee path: pay as i128 wrap must be fixed \
+         (before={}, after={})",
+        credits_before,
+        credits_after
+    );
+}
