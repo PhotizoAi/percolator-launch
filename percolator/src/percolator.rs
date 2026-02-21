@@ -1055,9 +1055,7 @@ impl RiskEngine {
         // Deduct from fee_credits (coupon: no insurance booking here —
         // insurance was already paid when credits were granted)
         self.accounts[idx as usize].fee_credits =
-        self.accounts[idx as usize]
-        .fee_credits
-        .saturating_add(u128_to_i128_clamped(pay));
+            self.accounts[idx as usize].fee_credits.saturating_sub(due as i128);
 
         // If fee_credits is negative, pay from capital using set_capital helper (spec §4.1)
         let mut paid_from_capital = 0u128;
@@ -1119,9 +1117,7 @@ impl RiskEngine {
         // Deduct from fee_credits (coupon: no insurance booking here —
         // insurance was already paid when credits were granted)
         self.accounts[idx as usize].fee_credits =
-        self.accounts[idx as usize]
-        .fee_credits
-        .saturating_add(u128_to_i128_clamped(pay));
+            self.accounts[idx as usize].fee_credits.saturating_sub(due as i128);
 
         // If negative, pay what we can from capital using set_capital helper (spec §4.1)
         let mut paid_from_capital = 0u128;
@@ -1168,9 +1164,7 @@ impl RiskEngine {
                 self.insurance_fund.balance = self.insurance_fund.balance + pay;
                 self.insurance_fund.fee_revenue = self.insurance_fund.fee_revenue + pay;
                 self.accounts[idx as usize].fee_credits =
-            self.accounts[idx as usize]
-        .fee_credits
-        .saturating_add(u128_to_i128_clamped(pay));
+                    self.accounts[idx as usize].fee_credits.saturating_add(pay as i128);
             }
         }
     }
@@ -3386,4 +3380,3 @@ impl RiskEngine {
         self.current_slot = self.current_slot.saturating_add(slots);
     }
 }
-
