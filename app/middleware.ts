@@ -30,7 +30,21 @@ function getRateLimit(ip: string): { remaining: number; reset: number } {
 }
 
 export function middleware(request: NextRequest) {
-  const ip = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ?? "unknown";
+  // Extract client IP respecting TRUSTED_PROXY_DEPTH env var.
+  // - TRUSTED_PROXY_DEPTH=0: Ignore X-Forwarded-For (direct exposure, no proxy)
+  // - TRUSTED_PROXY_DEPTH=1: One proxy layer (Vercel, Cloudflare) — use last IP
+  // - TRUSTED_PROXY_DEPTH=2: Two proxy layers — use second-to-last IP
+  // This prevents IP spoofing attacks via forged X-Forwarded-For headers.
+  const PROXY_DEPTH = Math.max(0, Number(process.env.TRUSTED_PROXY_DEPTH ?? 1));
+  let ip = "unknown";
+  if (PROXY_DEPTH > 0) {
+    const forwarded = request.headers.get("x-forwarded-for");
+    if (forwarded) {
+      const ips = forwarded.split(",").map((s) => s.trim());
+      const idx = Math.max(0, ips.length - PROXY_DEPTH);
+      ip = ips[idx] ?? "unknown";
+    }
+  }
   const isApi = request.nextUrl.pathname.startsWith("/api/");
 
   if (isApi) {
@@ -88,8 +102,8 @@ function addSecurityHeaders(response: NextResponse, nonce?: string) {
     "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
     "font-src 'self' https://fonts.gstatic.com",
     "img-src 'self' data: https: blob:",
-    "connect-src 'self' https://*.solana.com wss://*.solana.com https://*.supabase.co wss://*.supabase.co https://*.vercel-insights.com https://api.coingecko.com https://*.helius-rpc.com wss://*.helius-rpc.com https://api.dexscreener.com https://hermes.pyth.network https://*.up.railway.app wss://*.up.railway.app https://token.jup.ag blob:",
-    "frame-src 'none'",
+    "connect-src 'self' https://*.solana.com wss://*.solana.com https://*.supabase.co wss://*.supabase.co https://*.vercel-insights.com https://api.coingecko.com https://*.helius-rpc.com wss://*.helius-rpc.com https://api.dexscreener.com https://hermes.pyth.network https://*.up.railway.app wss://*.up.railway.app https://token.jup.ag https://auth.privy.io https://embedded-wallets.privy.io https://*.privy.systems https://*.rpc.privy.systems https://explorer-api.walletconnect.com wss://relay.walletconnect.com wss://relay.walletconnect.org wss://www.walletlink.org blob:",
+    "frame-src https://auth.privy.io https://embedded-wallets.privy.io https://phantom.app https://solflare.com https://verify.walletconnect.com https://verify.walletconnect.org",
     "object-src 'none'",
     "base-uri 'self'",
   ].join("; ");

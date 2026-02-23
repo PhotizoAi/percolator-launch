@@ -526,6 +526,163 @@ export function encodeUnpauseMarket(): Uint8Array {
 }
 
 // ============================================================================
+// PERC-117: Pyth Oracle CPI Instructions
+// ============================================================================
+
+/**
+ * SetPythOracle (Tag 32) — switch a market to Pyth-pinned mode.
+ *
+ * After this instruction:
+ * - oracle_authority is cleared → PushOraclePrice is disabled
+ * - index_feed_id is set to feed_id → validated on every price read
+ * - max_staleness_secs and conf_filter_bps are updated
+ * - All price reads go directly to read_pyth_price_e6() with on-chain
+ *   staleness + confidence + feed-ID validation (no silent fallback)
+ *
+ * Instruction data: tag(1) + feed_id(32) + max_staleness_secs(8) + conf_filter_bps(2) = 43 bytes
+ *
+ * Accounts:
+ *   0. [signer, writable] Admin
+ *   1. [writable]         Slab
+ */
+export interface SetPythOracleArgs {
+  /** 32-byte Pyth feed ID. All zeros is invalid (reserved for Hyperp mode). */
+  feedId: Uint8Array;
+  /** Maximum age of Pyth price in seconds before OracleStale is returned. Must be > 0. */
+  maxStalenessSecs: bigint;
+  /** Max confidence/price ratio in bps (0 = no confidence check). */
+  confFilterBps: number;
+}
+
+export function encodeSetPythOracle(args: SetPythOracleArgs): Uint8Array {
+  if (args.feedId.length !== 32) throw new Error('feedId must be 32 bytes');
+  if (args.maxStalenessSecs <= 0n) throw new Error('maxStalenessSecs must be > 0');
+
+  const buf = new Uint8Array(43);
+  const dv = new DataView(buf.buffer);
+
+  // Tag 32 (SetPythOracle)
+  buf[0] = 32;
+  buf.set(args.feedId, 1);
+  dv.setBigUint64(33, args.maxStalenessSecs, /* little-endian */ true);
+  dv.setUint16(41, args.confFilterBps, true);
+
+  return buf;
+}
+
+/**
+ * Derive the expected Pyth PriceUpdateV2 account address for a given feed ID.
+ * Uses PDA seeds: [shard_id(2), feed_id(32)] under the Pyth Receiver program.
+ *
+ * @param feedId  32-byte Pyth feed ID
+ * @param shardId Shard index (default 0 for mainnet/devnet)
+ */
+export const PYTH_RECEIVER_PROGRAM_ID = 'rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ';
+
+export async function derivePythPriceUpdateAccount(
+  feedId: Uint8Array,
+  shardId = 0,
+): Promise<string> {
+  const { PublicKey } = await import('@solana/web3.js');
+  const shardBuf = new Uint8Array(2);
+  new DataView(shardBuf.buffer).setUint16(0, shardId, true);
+  const [pda] = PublicKey.findProgramAddressSync(
+    [shardBuf, feedId],
+    new PublicKey(PYTH_RECEIVER_PROGRAM_ID),
+  );
+  return pda.toBase58();
+}
+
+// Add SetPythOracle to the tag registry
+(IX_TAG as Record<string, number>)['SetPythOracle'] = 32;
+
+// PERC-118: Mark Price EMA Instructions
+// ============================================================================
+
+// Tag 33 — permissionless mark price EMA crank
+(IX_TAG as Record<string, number>)['UpdateMarkPrice'] = 33;
+
+/**
+ * UpdateMarkPrice (Tag 33) — permissionless EMA mark price crank.
+ *
+ * Reads the current oracle price on-chain, applies 8-hour EMA smoothing
+ * with circuit breaker, and writes result to authority_price_e6.
+ *
+ * Instruction data: 1 byte (tag only — all params read from on-chain state)
+ *
+ * Accounts:
+ *   0. [writable] Slab
+ *   1. []         Oracle account (Pyth PriceUpdateV2 / Chainlink / DEX AMM)
+ *   2. []         Clock sysvar (SysvarC1ock11111111111111111111111111111111)
+ *   3..N []       Remaining accounts (PumpSwap vaults, etc. if needed)
+ */
+export function encodeUpdateMarkPrice(): Uint8Array {
+  return new Uint8Array([33]);
+}
+
+/**
+ * Mark price EMA parameters (must match program/src/percolator.rs constants).
+ */
+export const MARK_PRICE_EMA_WINDOW_SLOTS = 72_000n;
+export const MARK_PRICE_EMA_ALPHA_E6 = 2_000_000n / (MARK_PRICE_EMA_WINDOW_SLOTS + 1n);
+
+/**
+ * Compute the next EMA mark price step (TypeScript mirror of the on-chain function).
+ */
+export function computeEmaMarkPrice(
+  markPrevE6: bigint,
+  oracleE6: bigint,
+  dtSlots: bigint,
+  alphaE6 = MARK_PRICE_EMA_ALPHA_E6,
+  capE2bps = 0n,
+): bigint {
+  if (oracleE6 === 0n) return markPrevE6;
+  if (markPrevE6 === 0n || dtSlots === 0n) return oracleE6;
+
+  let oracleClamped = oracleE6;
+  if (capE2bps > 0n) {
+    const maxDelta = (markPrevE6 * capE2bps * dtSlots) / 1_000_000n;
+    const lo = markPrevE6 > maxDelta ? markPrevE6 - maxDelta : 0n;
+    const hi = markPrevE6 + maxDelta;
+    if (oracleClamped < lo) oracleClamped = lo;
+    if (oracleClamped > hi) oracleClamped = hi;
+  }
+
+  const effectiveAlpha = alphaE6 * dtSlots > 1_000_000n ? 1_000_000n : alphaE6 * dtSlots;
+  const oneMinusAlpha = 1_000_000n - effectiveAlpha;
+
+  return (oracleClamped * effectiveAlpha + markPrevE6 * oneMinusAlpha) / 1_000_000n;
+}
+
+// PERC-119: Hyperp EMA Oracle for Permissionless Tokens
+// ============================================================================
+
+// Tag 34 — permissionless Hyperp mark price oracle (reads DEX AMM pool)
+(IX_TAG as Record<string, number>)['UpdateHyperpMark'] = 34;
+
+/**
+ * UpdateHyperpMark (Tag 34) — permissionless Hyperp EMA oracle crank.
+ *
+ * Reads the spot price from a PumpSwap, Raydium CLMM, or Meteora DLMM pool,
+ * applies 8-hour EMA smoothing with circuit breaker, and writes the new mark
+ * to authority_price_e6 on the slab.
+ *
+ * This is the core mechanism for permissionless token markets — no Pyth or
+ * Chainlink feed is needed. The DEX AMM IS the oracle.
+ *
+ * Instruction data: 1 byte (tag only)
+ *
+ * Accounts:
+ *   0. [writable] Slab
+ *   1. []         DEX pool account (PumpSwap / Raydium CLMM / Meteora DLMM)
+ *   2. []         Clock sysvar (SysvarC1ock11111111111111111111111111111111)
+ *   3..N []       Remaining accounts (e.g. PumpSwap vault0 + vault1)
+ */
+export function encodeUpdateHyperpMark(): Uint8Array {
+  return new Uint8Array([34]);
+}
+
+// ============================================================================
 // MATCHER INSTRUCTIONS (sent to matcher program, not percolator)
 // ============================================================================
 

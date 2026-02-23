@@ -6,8 +6,12 @@ export type Network = "mainnet" | "devnet";
 
 function getNetwork(): Network {
   if (typeof window !== "undefined") {
-    const override = localStorage.getItem("percolator-network") as Network | null;
-    if (override === "mainnet" || override === "devnet") return override;
+    try {
+      const override = localStorage.getItem("percolator-network") as Network | null;
+      if (override === "mainnet" || override === "devnet") return override;
+    } catch {
+      // localStorage may be unavailable (SSR, iframes, or test environments)
+    }
   }
   // Trim env var to handle trailing whitespace/newlines (Vercel env var copy-paste issue)
   const envNet = process.env.NEXT_PUBLIC_DEFAULT_NETWORK?.trim();
@@ -15,30 +19,53 @@ function getNetwork(): Network {
   return "devnet";
 }
 
-/** Get RPC URL — uses /api/rpc proxy on client, direct Helius on server */
-function getRpcUrl(network: Network): string {
-  // Client-side: use RPC proxy (API key stays server-side)
+/** Get RPC endpoint — absolute /api/rpc on client, direct RPC on server */
+export function getRpcEndpoint(): string {
   if (typeof window !== "undefined") {
-    return "/api/rpc";
+    return new URL("/api/rpc", window.location.origin).toString();
   }
-  
-  // Server-side: use direct Helius URL (for SSR/SSG)
+
+  const explicit = process.env.NEXT_PUBLIC_HELIUS_RPC_URL?.trim();
+  if (explicit) return explicit;
+
   const apiKey = process.env.HELIUS_API_KEY ?? process.env.NEXT_PUBLIC_HELIUS_API_KEY ?? "";
-  return network === "mainnet"
-    ? `https://mainnet.helius-rpc.com/?api-key=${apiKey}`
-    : `https://devnet.helius-rpc.com/?api-key=${apiKey}`;
+  if (apiKey) {
+    const net = process.env.NEXT_PUBLIC_DEFAULT_NETWORK?.trim();
+    const network = net === "mainnet" ? "mainnet" : "devnet";
+    return network === "mainnet"
+      ? `https://mainnet.helius-rpc.com/?api-key=${apiKey}`
+      : `https://devnet.helius-rpc.com/?api-key=${apiKey}`;
+  }
+
+  return process.env.NEXT_PUBLIC_SOLANA_RPC_URL ?? "https://api.devnet.solana.com";
+}
+
+/**
+ * Get WebSocket endpoint for Solana Connection subscriptions.
+ * The HTTP proxy at /api/rpc doesn't support WebSocket upgrades,
+ * so we connect directly to Helius WSS for real-time subscriptions.
+ * Returns undefined if no Helius key is configured (disables WS subscriptions).
+ */
+export function getWsEndpoint(): string | undefined {
+  const apiKey = process.env.NEXT_PUBLIC_HELIUS_API_KEY ?? "";
+  if (!apiKey) return undefined;
+
+  const net = getNetwork();
+  return net === "mainnet"
+    ? `wss://mainnet.helius-rpc.com/?api-key=${apiKey}`
+    : `wss://devnet.helius-rpc.com/?api-key=${apiKey}`;
 }
 
 const CONFIGS = {
   mainnet: {
-    get rpcUrl() { return getRpcUrl("mainnet"); },
+    get rpcUrl() { return getRpcEndpoint(); },
     programId: "GM8zjJ8LTBMv9xEsverh6H6wLyevgMHEJXcEzyY3rY24",
     matcherProgramId: "DHP6DtwXP1yJsz8YzfoeigRFPB979gzmumkmCxDLSkUX",
-    crankWallet: "",  // TODO: set mainnet crank wallet
+    crankWallet: "",  // TODO: Deploy keeper bot to mainnet and set address (Issue #244)
     explorerUrl: "https://solscan.io",
   },
   devnet: {
-    get rpcUrl() { return getRpcUrl("devnet"); },
+    get rpcUrl() { return getRpcEndpoint(); },
     programId: "FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD",
     matcherProgramId: "4HcGCsyjAqnFua5ccuXyt8KRRQzKFbGTJkVChpS7Yfzy",
     crankWallet: "2JaSzRYrf44fPpQBtRJfnCEgThwCmvpFd3FCXi45VXxm",
@@ -52,10 +79,52 @@ const CONFIGS = {
   },
 } as const;
 
+/**
+ * Validate mainnet configuration safety.
+ * Throws descriptive error if mainnet is selected but not fully configured.
+ * Issue #244: Mainnet keeper bot and address setup required before production launch.
+ */
+function validateMainnetConfig(
+  config: (typeof CONFIGS)[keyof typeof CONFIGS],
+  network: Network
+): void {
+  if (network !== "mainnet") return;
+
+  const crankWallet = config.crankWallet as string;
+  if (!crankWallet || crankWallet.trim() === "") {
+    throw new Error(
+      "Mainnet Configuration Error: crankWallet not set. " +
+      "Keeper bot must be deployed to mainnet before production use. " +
+      "See Issue #244 for deployment requirements."
+    );
+  }
+
+  const matcherProgramId = config.matcherProgramId as string;
+  if (!matcherProgramId || matcherProgramId.trim() === "") {
+    throw new Error(
+      "Mainnet Configuration Error: matcherProgramId not set. " +
+      "Matcher program must be deployed to mainnet before production use."
+    );
+  }
+
+  const programId = config.programId as string;
+  if (!programId || programId.trim() === "") {
+    throw new Error(
+      "Mainnet Configuration Error: programId not set. " +
+      "Core program must be deployed to mainnet before production use."
+    );
+  }
+}
+
 export function getConfig() {
   const network = getNetwork();
+  const baseConfig = CONFIGS[network];
+
+  // Fail fast on unsafe mainnet configuration (Issue #244)
+  validateMainnetConfig(baseConfig, network);
+
   return {
-    ...CONFIGS[network],
+    ...baseConfig,
     network,
     // Default slab size — variable sizes now supported via SLAB_TIERS
     slabSize: 992_560,
@@ -66,7 +135,11 @@ export function getConfig() {
 
 export function setNetwork(network: Network) {
   if (typeof window !== "undefined") {
-    localStorage.setItem("percolator-network", network);
+    try {
+      localStorage.setItem("percolator-network", network);
+    } catch {
+      // localStorage may be unavailable (iframes with restrictive policies)
+    }
     window.location.reload();
   }
 }
