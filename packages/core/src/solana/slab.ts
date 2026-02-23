@@ -650,6 +650,7 @@ export function isAccountUsed(data: Uint8Array, idx: number): boolean {
  * Calculate the maximum valid account index for a given slab size.
  */
 export function maxAccountIndex(dataLen: number): number {
+  if (!Number.isSafeInteger(dataLen) || dataLen < 0) return 0;
   const layout = detectLayout(dataLen);
   const accOff = layout ? layout.accountsOff : ENGINE_ACCOUNTS_OFF;
   const accountsEnd = dataLen - ENGINE_OFF - accOff;
@@ -662,7 +663,7 @@ export function maxAccountIndex(dataLen: number): number {
  */
 export function parseAccount(data: Uint8Array, idx: number): Account {
   const maxIdx = maxAccountIndex(data.length);
-  if (idx < 0 || idx >= maxIdx) {
+  if (!Number.isInteger(idx) || idx < 0 || idx >= maxIdx) {
     throw new Error(`Account index out of range: ${idx} (max: ${maxIdx - 1})`);
   }
 
