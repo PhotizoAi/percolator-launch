@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { PublicKey } from "@solana/web3.js";
 import {
   parseHeader, parseConfig, parseEngine, parseAllAccounts, parseParams,
-  parseAccount, maxAccountIndex,
+  parseAccount, maxAccountIndex, isAccountUsed,
 } from "../src/solana/slab.js";
 
 /** Build a minimal valid slab buffer for header + config + engine (no accounts). */
@@ -163,5 +163,27 @@ describe("parseAccount index guard", () => {
   it("throws on out-of-bounds large index", () => {
     const buf = buildMockSlab();
     expect(() => parseAccount(buf, 999999)).toThrow("out of range");
+  });
+});
+
+describe("isAccountUsed index guard", () => {
+  it("returns false for NaN index (no TypeError)", () => {
+    const buf = buildMockSlab();
+    expect(isAccountUsed(buf, NaN)).toBe(false);
+  });
+
+  it("returns false for float index (no TypeError)", () => {
+    const buf = buildMockSlab();
+    expect(isAccountUsed(buf, 0.5)).toBe(false);
+  });
+
+  it("returns false for negative index", () => {
+    const buf = buildMockSlab();
+    expect(isAccountUsed(buf, -1)).toBe(false);
+  });
+
+  it("returns false for out-of-bounds index", () => {
+    const buf = buildMockSlab();
+    expect(isAccountUsed(buf, 999999)).toBe(false);
   });
 });
