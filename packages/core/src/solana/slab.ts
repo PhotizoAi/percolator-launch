@@ -638,7 +638,7 @@ export function parseUsedIndices(data: Uint8Array): number[] {
 export function isAccountUsed(data: Uint8Array, idx: number): boolean {
   const layout = detectLayout(data.length);
   const maxAcc = layout ? layout.maxAccounts : DEFAULT_MAX_ACCOUNTS;
-  if (idx < 0 || idx >= maxAcc) return false;
+  if (!Number.isInteger(idx) || idx < 0 || idx >= maxAcc) return false;
   const base = ENGINE_OFF + ENGINE_BITMAP_OFF;
   const word = Math.floor(idx / 64);
   const bit = idx % 64;
@@ -650,6 +650,7 @@ export function isAccountUsed(data: Uint8Array, idx: number): boolean {
  * Calculate the maximum valid account index for a given slab size.
  */
 export function maxAccountIndex(dataLen: number): number {
+  if (!Number.isSafeInteger(dataLen) || dataLen < 0) return 0;
   const layout = detectLayout(dataLen);
   const accOff = layout ? layout.accountsOff : ENGINE_ACCOUNTS_OFF;
   const accountsEnd = dataLen - ENGINE_OFF - accOff;

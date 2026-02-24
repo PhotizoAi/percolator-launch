@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import { PublicKey } from "@solana/web3.js";
 import {
   parseHeader, parseConfig, parseEngine, parseAllAccounts, parseParams,
+  parseAccount, maxAccountIndex, isAccountUsed,
 } from "../src/solana/slab.js";
 
 /** Build a minimal valid slab buffer for header + config + engine (no accounts). */
@@ -108,5 +109,81 @@ describe("parseAllAccounts", () => {
     const buf = buildMockSlab();
     const accounts = parseAllAccounts(buf);
     expect(accounts).toEqual([]);
+  });
+});
+
+describe("maxAccountIndex integer safety", () => {
+  it("returns 0 for NaN dataLen", () => {
+    expect(maxAccountIndex(NaN)).toBe(0);
+  });
+
+  it("returns 0 for Infinity dataLen", () => {
+    expect(maxAccountIndex(Infinity)).toBe(0);
+  });
+
+  it("returns 0 for negative dataLen", () => {
+    expect(maxAccountIndex(-1)).toBe(0);
+  });
+
+  it("returns 0 for float dataLen (large)", () => {
+    expect(maxAccountIndex(992560.5)).toBe(0);
+  });
+
+  it("returns 0 for float dataLen (small)", () => {
+    expect(maxAccountIndex(10.5)).toBe(0);
+  });
+
+  it("returns a positive count for valid dataLen", () => {
+    expect(maxAccountIndex(992_560)).toBeGreaterThan(0);
+  });
+});
+
+describe("parseAccount index guard", () => {
+  it("throws on NaN index (would bypass numeric comparison)", () => {
+    const buf = buildMockSlab();
+    expect(() => parseAccount(buf, NaN)).toThrow("out of range");
+  });
+
+  it("throws on float index (misaligned offset)", () => {
+    const buf = buildMockSlab();
+    expect(() => parseAccount(buf, 0.5)).toThrow("out of range");
+  });
+
+  it("throws on negative index", () => {
+    const buf = buildMockSlab();
+    expect(() => parseAccount(buf, -1)).toThrow("out of range");
+  });
+
+  it("throws on out-of-bounds integer index", () => {
+    const buf = buildMockSlab();
+    const max = maxAccountIndex(buf.length);
+    expect(() => parseAccount(buf, max)).toThrow("out of range");
+  });
+
+  it("throws on out-of-bounds large index", () => {
+    const buf = buildMockSlab();
+    expect(() => parseAccount(buf, 999999)).toThrow("out of range");
+  });
+});
+
+describe("isAccountUsed index guard", () => {
+  it("returns false for NaN index (no TypeError)", () => {
+    const buf = buildMockSlab();
+    expect(isAccountUsed(buf, NaN)).toBe(false);
+  });
+
+  it("returns false for float index (no TypeError)", () => {
+    const buf = buildMockSlab();
+    expect(isAccountUsed(buf, 0.5)).toBe(false);
+  });
+
+  it("returns false for negative index", () => {
+    const buf = buildMockSlab();
+    expect(isAccountUsed(buf, -1)).toBe(false);
+  });
+
+  it("returns false for out-of-bounds index", () => {
+    const buf = buildMockSlab();
+    expect(isAccountUsed(buf, 999999)).toBe(false);
   });
 });

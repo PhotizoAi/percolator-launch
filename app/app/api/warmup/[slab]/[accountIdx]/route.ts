@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { Connection, PublicKey } from "@solana/web3.js";
-import { fetchSlab, parseAccount, parseEngine, parseParams } from "@percolator/core";
+import { fetchSlab, parseAccount, parseParams, isAccountUsed } from "@percolator/core";
 import { getConfig } from "@/lib/config";
 
 export const dynamic = "force-dynamic";
@@ -27,11 +27,11 @@ export async function GET(
     const cfg = getConfig();
     const connection = new Connection(cfg.rpcUrl, "confirmed");
     const data = await fetchSlab(connection, slabPk);
-    const engine = parseEngine(data);
     const riskParams = parseParams(data);
 
-    // Check if account index is valid
-    if (accountIdx >= engine.numUsedAccounts) {
+    // Check account is present in the bitmap (count != index: a slab with
+    // one account at slot 500 has numUsedAccounts=1, so "idx < 1" is wrong)
+    if (!isAccountUsed(data, accountIdx)) {
       return NextResponse.json({ error: "Account not found" }, { status: 404 });
     }
 
