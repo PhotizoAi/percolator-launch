@@ -5247,12 +5247,15 @@ pub mod processor {
                 state::write_dust_base(&mut data, old_dust.saturating_add(dust));
 
                 // Calculate LP tokens to mint
-                let lp_tokens_to_mint: u64 = if lp_supply == 0 {
-                    // First deposit: 1:1 ratio (units of collateral = LP tokens)
-                    // Guard: if insurance already has balance but supply is 0, that means
-                    // admin topped up via TopUpInsurance before creating LP mint.
-                    // Still safe: first LP depositor gets tokens proportional to their deposit only.
+                let lp_tokens_to_mint: u64 = if lp_supply == 0 && insurance_balance_before == 0 {
+                    // True first deposit — LP supply and insurance fund are both empty. 1:1 ratio.
                     units
+                } else if lp_supply == 0 {
+                    // LP supply is 0 but insurance fund has pre-existing balance (from fees,
+                    // liquidations, or TopUpInsurance calls). Minting at 1:1 would give this
+                    // depositor sole ownership of all pre-existing insurance value — theft.
+                    // Reject until the admin seeds the first LP deposit at the correct ratio.
+                    return Err(PercolatorError::InsuranceSupplyMismatch.into());
                 } else {
                     if insurance_balance_before == 0 {
                         // Shouldn't happen: supply > 0 but balance == 0 means fund was drained.
@@ -5344,6 +5347,9 @@ pub mod processor {
                 // Verify insurance LP mint PDA
                 let (expected_lp_mint, _) = accounts::derive_insurance_lp_mint(program_id, a_slab.key);
                 accounts::expect_key(a_ins_lp_mint, &expected_lp_mint)?;
+                // Verify withdrawer's LP token account belongs to them and matches the LP mint.
+                // Defense-in-depth: SPL burn enforces this too, but explicit check is cleaner.
+                verify_token_account(a_withdrawer_lp_ata, a_withdrawer.key, &expected_lp_mint)?;
 
                 if a_ins_lp_mint.data_len() == 0 {
                     return Err(PercolatorError::InsuranceMintNotCreated.into());

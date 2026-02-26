@@ -790,3 +790,65 @@ confidence in the LP math, overflow safety, and cooldown enforcement.
 **The program is considered suitable for testnet deployment.**  Mainnet deployment
 should be preceded by fixing P1–P3 above and conducting an independent professional
 audit of the full state machine.
+
+---
+
+## Open Bugs Quick Reference
+
+This section answers *"which bugs are not yet fixed, and exactly where in the code?"*
+
+### percolator-stake (dcccrypto/percolator-stake, commit 878c7b023e8800848122513f9534c1a38f978a98)
+
+These findings exist in the **external** percolator-stake repository.
+File paths are relative to that repo's root.
+
+| ID | Severity | File | Line(s) | Bug |
+|----|----------|------|---------|-----|
+| N1 | INFO | `src/cpi.rs` | 288 | `pub fn cpi_withdraw_insurance` is dead code — never called by the processor. Should be removed or documented. |
+| N2 | LOW | `src/cpi.rs` | 328, 367 | Section-header comments say "Tag 21" and "Tag 22"; actual constants at lines 39–40 are `TAG_SET_INSURANCE_WITHDRAW_POLICY = 30` and `TAG_WITHDRAW_INSURANCE_LIMITED = 31`. Misleads future readers. |
+| N3 | INFO | `src/processor.rs` | 909 | `process_admin_withdraw_insurance` calls `Pubkey::find_program_address(...)` at runtime. Should use `Pubkey::create_program_address` with the stored bump (`pool.vault_authority_bump`) for O(1) cost. |
+| N4 | LOW | `src/processor.rs` | ~571 | `process_flush_to_insurance` never calls `verify_token_program(token_program)?` before invoking the CPI. Inconsistent with the pattern in `process_deposit` (line 469) and `process_withdraw` (line 327). |
+| N5 | LOW | `src/processor.rs` | ~896 | `process_admin_withdraw_insurance` does not validate `stake_vault.key == pool.vault`. A trusted admin could accidentally route insurance returns to a different vault, causing `total_pool_value()` to overstate the real vault balance. |
+| N6 | INFO | `src/processor.rs` | ~195 (in `process_init_pool`) | LP mint initialized with hardcoded `6` decimals. Should accept and match the collateral mint's decimals. |
+| N7 | INFO | `src/processor.rs` | ~941 (in `process_admin_withdraw_insurance`) | `total_returned` incremented without bounding against `total_flushed`. If accounting drifts, `total_pool_value()` inflates silently. |
+| N8 | INFO | `src/processor.rs` | ~143 (in `process_init_pool`) | `lp_mint` and `vault` are not verified to be uninitialised token accounts before calling SPL `initialize_mint` / `initialize_account`. The SPL program enforces this, but an explicit check would fail earlier. |
+| H5 | HIGH | `src/instruction.rs` | `unpack` fn | Trailing bytes after a valid instruction payload are silently ignored. Accepted as standard Solana forward-compat ABI; effective risk is low. |
+| L1 | LOW | `src/processor.rs` | ~143 (in `process_init_pool`) | `collateral_mint` stored at init time is never verified against the wrapper slab's configured collateral mint. A misconfigured pool would only be rejected at first CPI use. |
+
+### percolator-launch (this repository — program/src/percolator.rs)
+
+These are findings from the PR3 audit of Tags 24/25/26, checked against the
+**current merged code** (live as of this PR's baseline).
+
+| ID | Severity | File | Line(s) | Status before this PR | Fix applied |
+|----|----------|------|---------|----------------------|-------------|
+| PR3-F1 | CRITICAL | `program/src/percolator.rs` | 5344–5346 | ✅ FIXED — PDA derivation replaces mint-authority check | No change needed |
+| PR3-F2 | HIGH | `program/src/percolator.rs` | 5250–5273 | ⚠️ PARTIALLY OPEN — `lp_supply==0 && insurance_balance>0` allowed 1:1 mint (orphaned-value theft) | **✅ FIXED in this PR** |
+| PR3-F3 | HIGH | `program/src/percolator.rs` | 5305–5424 | ⚠️ FEATURE REMOVED — cooldown mechanism dropped; no JIT protection exists | Design choice; no fix |
+| PR3-F4 | MEDIUM | N/A | N/A | ⚠️ N/A — cooldown removed, this finding no longer applies | N/A |
+| PR3-F5 | MEDIUM | `program/src/percolator.rs` | 5164, 5572 | ✅ FIXED — uses `Rent::get()?` | No change needed |
+| PR3-F7 | LOW | N/A | N/A | ⚠️ N/A — `InsuranceLPStake` PDA and `cumulative_deposited` field removed from design | N/A |
+| PR3-F8 | LOW | `program/src/percolator.rs` | 5201 | ⚠️ OPEN — only checks `amount == 0`; no minimum deposit enforced | Accepted (griefing cost > gain) |
+| PR3-F9 | LOW | `program/src/percolator.rs` | 5347 | ⚠️ OPEN (defense-in-depth) | **✅ FIXED in this PR** — added `verify_token_account` for LP ATA in `WithdrawInsuranceLP` |
+
+### Summary of Remaining Open Items (both repos combined)
+
+| # | Repo | ID | Severity | File | Line | Description |
+|---|------|----|----------|------|------|-------------|
+| 1 | stake | N2 | LOW | `src/cpi.rs` | 328, 367 | Stale "Tag 21/22" comments |
+| 2 | stake | N4 | LOW | `src/processor.rs` | ~571 | Missing `verify_token_program` in flush |
+| 3 | stake | N5 | LOW | `src/processor.rs` | ~896 | No `stake_vault == pool.vault` check |
+| 4 | stake | N1 | INFO | `src/cpi.rs` | 288 | Dead function `cpi_withdraw_insurance` |
+| 5 | stake | N3 | INFO | `src/processor.rs` | 909 | `find_program_address` instead of stored bump |
+| 6 | stake | N6 | INFO | `src/processor.rs` | ~195 | Hardcoded LP mint decimals (6) |
+| 7 | stake | N7 | INFO | `src/processor.rs` | ~941 | `total_returned` not bounded |
+| 8 | stake | N8 | INFO | `src/processor.rs` | ~143 | InitPool doesn't pre-check accounts |
+| 9 | stake | H5 | HIGH | `src/instruction.rs` | `unpack` | Trailing bytes — accepted |
+| 10 | stake | L1 | LOW | `src/processor.rs` | ~143 | Collateral mint not validated vs slab — documented |
+| 11 | launch | PR3-F3 | HIGH | `program/src/percolator.rs` | 5305+ | No cooldown/JIT protection in `WithdrawInsuranceLP` — design decision |
+| 12 | launch | PR3-F8 | LOW | `program/src/percolator.rs` | 5201 | No minimum deposit for `DepositInsuranceLP` — accepted |
+
+**Items fixed in this PR (percolator-launch):**
+- PR3-F2 (`program/src/percolator.rs` line 5250): Orphaned-value theft when `lp_supply==0 && insurance_balance>0`
+- PR3-F9 (`program/src/percolator.rs` line ~5347): Missing `verify_token_account` for LP ATA in `WithdrawInsuranceLP`
+
