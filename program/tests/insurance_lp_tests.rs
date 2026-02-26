@@ -163,19 +163,19 @@ fn encode_init_market(fixture: &MarketFixture, crank_staleness: u64) -> Vec<u8> 
     encode_u32(0, &mut data); // unit_scale
     encode_u64(0, &mut data); // initial_mark_price_e6
 
-    encode_u64(0, &mut data); // warmup_period_slots
-    encode_u64(0, &mut data); // maintenance_margin_bps
-    encode_u64(0, &mut data);
-    encode_u64(0, &mut data);
-    encode_u64(64, &mut data);
-    encode_u128(0, &mut data);
-    encode_u128(0, &mut data);
-    encode_u128(0, &mut data);
-    encode_u64(crank_staleness, &mut data);
-    encode_u64(0, &mut data);
-    encode_u128(0, &mut data);
-    encode_u64(0, &mut data);
-    encode_u128(0, &mut data);
+    encode_u64(0, &mut data);     // warmup_period_slots
+    encode_u64(500, &mut data);   // maintenance_margin_bps (5%)
+    encode_u64(1000, &mut data);  // initial_margin_bps (10%)
+    encode_u64(30, &mut data);    // trading_fee_bps (0.3%)
+    encode_u64(64, &mut data);    // max_accounts
+    encode_u128(0, &mut data);    // new_account_fee
+    encode_u128(0, &mut data);    // risk_reduction_threshold
+    encode_u128(0, &mut data);    // maintenance_fee_per_slot
+    encode_u64(crank_staleness, &mut data); // max_crank_staleness_slots
+    encode_u64(0, &mut data);     // liquidation_fee_bps
+    encode_u128(0, &mut data);    // liquidation_fee_cap
+    encode_u64(0, &mut data);     // liquidation_buffer_bps
+    encode_u128(0, &mut data);    // min_liquidation_abs
     data
 }
 
@@ -1179,6 +1179,92 @@ fn test_deposit_with_supply_but_zero_balance_fails() {
         let result = process_instruction(&f.program_id, &accounts, &data);
         assert_eq!(result.unwrap_err(), PercolatorError::InsuranceSupplyMismatch.into());
     }
+}
+
+/// PR3-F2: Orphaned-value theft — lp_supply == 0 but insurance_balance > 0.
+///
+/// Attack scenario (mirrors C9 in percolator-stake):
+///   1. Fees/liquidation profits accumulate in the insurance fund (balance > 0).
+///   2. No LP depositors exist yet (supply == 0).
+///   3. Attacker deposits 1 unit at 1:1 → gets 1 LP token representing the
+///      ENTIRE insurance fund balance + their deposit.
+///   4. Attacker immediately burns 1 LP → withdraws everything.
+///
+/// Expected: DepositInsuranceLP must return InsuranceSupplyMismatch when
+/// lp_supply == 0 but insurance_balance > 0.
+#[test]
+#[cfg(feature = "test")]
+fn test_deposit_orphaned_value_blocked() {
+    let (mut f, mut ins_mint) = setup_market_with_ins_mint();
+    let (vault_auth, _) = accounts::derive_vault_authority(&f.program_id, &f.slab.key);
+    let (ins_lp_mint_key, _) = accounts::derive_insurance_lp_mint(&f.program_id, &f.slab.key);
+    let mut vault_auth_acct = TestAccount::new(vault_auth, solana_program::system_program::id(), 0, vec![]);
+
+    // Manually inject pre-existing insurance balance (simulating accrued fees/liquidation profits)
+    // while lp_supply remains 0 (no LP depositors yet).
+    {
+        let engine = zc::engine_mut(&mut f.slab.data).unwrap();
+        engine.insurance_fund.balance = U128::new(500_000);
+    }
+    // Confirm setup is correct: balance injected, supply still 0
+    assert_eq!(read_insurance_balance(&f.slab.data), 500_000u128);
+    assert_eq!(read_mint_supply(&ins_mint.data), 0);
+
+    // Attacker tries to deposit 1 unit — at 1:1 they'd get 1 LP representing 500_001 total
+    let attacker_key = Pubkey::new_unique();
+    let mut attacker = TestAccount::new(attacker_key, solana_program::system_program::id(), 0, vec![]).signer();
+    let mut attacker_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
+        make_token_account(f.mint.key, attacker_key, 1_000_000)).writable();
+    let mut attacker_lp_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
+        make_token_account(ins_lp_mint_key, attacker_key, 0)).writable();
+
+    let data = encode_deposit_insurance_lp(1);
+    let accounts = vec![
+        attacker.to_info(), f.slab.to_info(), attacker_ata.to_info(),
+        f.vault.to_info(), f.token_prog.to_info(), ins_mint.to_info(),
+        attacker_lp_ata.to_info(), vault_auth_acct.to_info(),
+    ];
+    let result = process_instruction(&f.program_id, &accounts, &data);
+    // Must be blocked — depositing into an orphaned insurance fund steals the existing balance
+    assert_eq!(result.unwrap_err(), PercolatorError::InsuranceSupplyMismatch.into());
+
+    // Insurance balance and LP supply must be unchanged
+    assert_eq!(read_mint_supply(&ins_mint.data), 0);
+    assert_eq!(read_insurance_balance(&f.slab.data), 500_000u128);
+}
+
+/// Complementary: true first deposit (supply == 0, balance == 0) still works.
+#[test]
+#[cfg(feature = "test")]
+fn test_deposit_true_first_deposit_allowed() {
+    let (mut f, mut ins_mint) = setup_market_with_ins_mint();
+    let (vault_auth, _) = accounts::derive_vault_authority(&f.program_id, &f.slab.key);
+    let (ins_lp_mint_key, _) = accounts::derive_insurance_lp_mint(&f.program_id, &f.slab.key);
+    let mut vault_auth_acct = TestAccount::new(vault_auth, solana_program::system_program::id(), 0, vec![]);
+
+    // Both supply and balance are 0 — true first deposit, must succeed at 1:1
+    assert_eq!(read_mint_supply(&ins_mint.data), 0);
+    assert_eq!(read_insurance_balance(&f.slab.data), 0u128);
+
+    let depositor_key = Pubkey::new_unique();
+    let mut depositor = TestAccount::new(depositor_key, solana_program::system_program::id(), 0, vec![]).signer();
+    let mut depositor_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
+        make_token_account(f.mint.key, depositor_key, 1_000_000)).writable();
+    let mut depositor_lp_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
+        make_token_account(ins_lp_mint_key, depositor_key, 0)).writable();
+
+    let data = encode_deposit_insurance_lp(100_000);
+    let accounts = vec![
+        depositor.to_info(), f.slab.to_info(), depositor_ata.to_info(),
+        f.vault.to_info(), f.token_prog.to_info(), ins_mint.to_info(),
+        depositor_lp_ata.to_info(), vault_auth_acct.to_info(),
+    ];
+    process_instruction(&f.program_id, &accounts, &data).unwrap();
+
+    // 1:1 ratio — deposited 100_000, got 100_000 LP
+    assert_eq!(read_mint_supply(&ins_mint.data), 100_000);
+    assert_eq!(read_insurance_balance(&f.slab.data), 100_000u128);
+    assert_eq!(read_token_balance(&depositor_lp_ata.data), 100_000);
 }
 
 #[test]
