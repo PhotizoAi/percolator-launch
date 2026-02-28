@@ -5588,3 +5588,166 @@ fn test_lp_fee_proportional_distribution() {
 
     assert_conserved(&engine);
 }
+
+// ============================================================================
+// Bug-Fix Regression Tests
+// ============================================================================
+
+/// Bug 1 Fix: execute_trade must use compute_dynamic_fee_bps (PERC-120), not
+/// the flat trading_fee_bps.  Verify that a tiered fee schedule is actually
+/// applied to real trades.
+///
+/// Setup: tier-2 threshold = 500_000 notional, tier-2 rate = 20 bps (vs flat 5 bps).
+/// Trade a notional that exceeds the tier-2 threshold and confirm that the fee
+/// charged is the tier-2 rate, not the flat rate.
+#[test]
+fn test_execute_trade_uses_dynamic_fee_tier() {
+    let mut params = default_params();
+    params.trading_fee_bps = 5;          // Tier 1: 0.05 %
+    params.fee_tier2_bps = 20;           // Tier 2: 0.20 %
+    params.fee_tier2_threshold = 500_000; // Switch to Tier 2 above this notional
+    params.fee_tier3_bps = 0;
+    params.fee_tier3_threshold = 0;
+    params.fee_utilization_surge_bps = 0;
+    params.initial_margin_bps = 100;     // 1% — keeps margin from blocking the trade
+    params.maintenance_margin_bps = 50;
+    params.warmup_period_slots = 0;
+
+    let mut engine = Box::new(RiskEngine::new(params));
+
+    let user_idx = engine.add_user(0).unwrap();
+    let lp_idx   = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
+
+    engine.deposit(user_idx, 10_000_000, 0).unwrap();
+    engine.deposit(lp_idx,   10_000_000, 0).unwrap();
+
+    let oracle = 1_000_000u64; // price = 1.0 (in 1e6 units)
+    // exec_size = 600_000 → exec notional = 600_000 * 1_000_000 / 1_000_000 = 600_000
+    // That is above tier-2 threshold (500_000), so fee_bps must be 20, not 5.
+    let size: i128 = 600_000;
+
+    let ins_before = engine.insurance_fund.balance.get();
+
+    engine.execute_trade(&MATCHER, lp_idx, user_idx, 0, oracle, size).unwrap();
+
+    let ins_after = engine.insurance_fund.balance.get();
+    let fee_charged = ins_after - ins_before;
+
+    // Flat tier-1 fee would be: (600_000 * 5 + 9999) / 10_000 = 300  (ceiling)
+    // Tier-2 fee must be:       (600_000 * 20 + 9999) / 10_000 = 1200 (ceiling)
+    let flat_fee_t1  = (600_000u128 * 5  + 9999) / 10_000;
+    let tiered_fee_t2 = (600_000u128 * 20 + 9999) / 10_000;
+
+    assert_ne!(
+        fee_charged, flat_fee_t1,
+        "Bug 1 would reproduce: fee {} equals flat tier-1 rate {}",
+        fee_charged, flat_fee_t1
+    );
+    assert_eq!(
+        fee_charged, tiered_fee_t2,
+        "execute_trade must apply tier-2 rate; expected {}, got {}",
+        tiered_fee_t2, fee_charged
+    );
+
+    assert_conserved(&engine);
+}
+
+/// Bug 1 Fix: execute_trade must apply the utilization-based surge fee.
+///
+/// Pre-load OI to 50 % utilization, then execute a trade and verify the fee
+/// includes the surge component, not just the flat rate.
+#[test]
+fn test_execute_trade_uses_dynamic_fee_surge() {
+    let mut params = default_params();
+    params.trading_fee_bps = 10;              // base: 0.10 %
+    params.fee_utilization_surge_bps = 20;    // max 20 bps extra at 100 % util
+    params.fee_tier2_threshold = 0;           // tiers disabled
+    params.initial_margin_bps = 100;
+    params.maintenance_margin_bps = 50;
+    params.warmup_period_slots = 0;
+
+    let mut engine = Box::new(RiskEngine::new(params));
+
+    let user_idx = engine.add_user(0).unwrap();
+    let lp_idx   = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
+
+    engine.deposit(user_idx, 10_000_000, 0).unwrap();
+    engine.deposit(lp_idx,   10_000_000, 0).unwrap();
+
+    // Force vault = 1_000_000 and OI = 1_000_000 → utilization = 50 % → surge = 10 bps
+    engine.vault = U128::new(1_000_000);
+    engine.total_open_interest = U128::new(1_000_000);
+    // Re-sync c_tot after manual vault change
+    engine.c_tot = U128::new(engine.accounts.iter().map(|a| a.capital.get()).sum::<u128>());
+
+    let oracle = 1_000_000u64;
+    let size: i128 = 1_000; // small size so notional = 1_000
+
+    let ins_before = engine.insurance_fund.balance.get();
+
+    engine.execute_trade(&MATCHER, lp_idx, user_idx, 0, oracle, size).unwrap();
+
+    let ins_after  = engine.insurance_fund.balance.get();
+    let fee_charged = ins_after - ins_before;
+
+    // With 50 % utilization: effective_bps = 10 + 20*0.5 = 20
+    // Expected fee = (1_000 * 20 + 9999) / 10_000 = 2 (ceiling)
+    // Bug would give: (1_000 * 10 + 9999) / 10_000 = 1 (flat-only)
+    let expected_with_surge = (1_000u128 * 20 + 9999) / 10_000;
+    let expected_flat_only  = (1_000u128 * 10 + 9999) / 10_000;
+
+    assert_ne!(
+        fee_charged, expected_flat_only,
+        "Bug 1 would reproduce: fee {} equals flat rate (no surge applied)",
+        fee_charged
+    );
+    assert_eq!(
+        fee_charged, expected_with_surge,
+        "execute_trade must include utilization surge; expected {}, got {}",
+        expected_with_surge, fee_charged
+    );
+}
+
+/// Bug 2 Fix: the `other_fee_share` dead-variable warning is gone after the
+/// fix (the binding was removed).  This test confirms that the fee accounting
+/// remains correct regardless — i.e. the full fee still reaches insurance when
+/// no fee split is configured (legacy mode).
+#[test]
+fn test_execute_trade_full_fee_to_insurance_legacy() {
+    // Legacy: all fee_split_*_bps = 0 → 100 % of fee goes to insurance_balance.
+    let mut params = default_params();
+    params.trading_fee_bps = 10;
+    params.fee_split_lp_bps = 0;
+    params.fee_split_protocol_bps = 0;
+    params.fee_split_creator_bps = 0;
+    params.initial_margin_bps = 100;
+    params.maintenance_margin_bps = 50;
+    params.warmup_period_slots = 0;
+
+    let mut engine = Box::new(RiskEngine::new(params));
+
+    let user_idx = engine.add_user(0).unwrap();
+    let lp_idx   = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
+
+    engine.deposit(user_idx, 10_000_000, 0).unwrap();
+    engine.deposit(lp_idx,   10_000_000, 0).unwrap();
+
+    let oracle: u64 = 1_000_000;
+    let size: i128  = 100_000;
+    // notional = 100_000; fee = (100_000 * 10 + 9999) / 10_000 = 100
+
+    let ins_before = engine.insurance_fund.balance.get();
+    engine.execute_trade(&MATCHER, lp_idx, user_idx, 0, oracle, size).unwrap();
+    let fee = engine.insurance_fund.balance.get() - ins_before;
+
+    let expected = (100_000u128 * 10 + 9999) / 10_000;
+    assert_eq!(fee, expected,
+        "Legacy mode: full fee must reach insurance_balance; expected {}, got {}",
+        expected, fee);
+
+    // LP accumulator must be zero (no split configured)
+    assert_eq!(engine.lp_fee_acc_per_unit_e12.get(), 0,
+        "LP accumulator must stay zero in legacy fee mode");
+
+    assert_conserved(&engine);
+}

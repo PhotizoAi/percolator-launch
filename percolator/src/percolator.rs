@@ -3553,22 +3553,28 @@ impl RiskEngine {
         self.settle_maintenance_fee(user_idx, now_slot, oracle_price)?;
         self.settle_maintenance_fee(lp_idx, now_slot, oracle_price)?;
 
-        // Calculate fee (ceiling division to prevent micro-trade fee evasion)
+        // Calculate fee using the dynamic fee schedule (PERC-120):
+        //   - Tiered rate based on notional size  (fee_tier2/3_bps thresholds)
+        //   - Utilization-based surge              (fee_utilization_surge_bps × OI / 2V)
+        // Falls back to flat trading_fee_bps when tiers are not configured.
+        // Ceiling division prevents micro-trade fee evasion.
         let notional =
             mul_u128(saturating_abs_i128(exec_size) as u128, exec_price as u128) / 1_000_000;
-        let fee = if notional > 0 && self.params.trading_fee_bps > 0 {
+        let fee_bps = self.compute_dynamic_fee_bps(notional);
+        let fee = if notional > 0 && fee_bps > 0 {
             // Ceiling division: ensures at least 1 atomic unit fee for any real trade
-            (mul_u128(notional, self.params.trading_fee_bps as u128) + 9999) / 10_000
+            (mul_u128(notional, fee_bps as u128) + 9999) / 10_000
         } else {
             0
         };
 
-        // Compute LP vault fee split before split_at_mut (avoids borrow conflict).
+        // Compute LP vault fee share before split_at_mut (avoids borrow conflict).
         // LP share goes to the fee accumulator (stays in vault, available for LP claims).
-        // Other shares go to the insurance fund.
-        let (lp_fee_share, other_fee_share) = {
-            let (lp, protocol, creator) = self.compute_fee_split(fee);
-            (lp, protocol.saturating_add(creator))
+        // Full fee is posted to insurance_balance for conservation; LP claims then
+        // transfer their portion from insurance_balance to LP capital.
+        let lp_fee_share = {
+            let (lp, _protocol, _creator) = self.compute_fee_split(fee);
+            lp
         };
 
         // Access both accounts
