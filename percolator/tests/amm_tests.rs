@@ -34,6 +34,8 @@ fn default_params() -> RiskParams {
         fee_split_protocol_bps: 0,
         fee_split_creator_bps: 0,
         fee_utilization_surge_bps: 0,
+        oi_hard_cap_multiplier: 0,
+        max_pnl_cap_ratio_bps: 0,
     }
 }
 

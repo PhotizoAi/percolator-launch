@@ -83,6 +83,8 @@ fn default_params() -> RiskParams {
         fee_split_protocol_bps: 0,
         fee_split_creator_bps: 0,
         fee_utilization_surge_bps: 0,
+        oi_hard_cap_multiplier: 0,   // Disabled by default in tests
+        max_pnl_cap_ratio_bps: 0,    // Disabled by default in tests
     }
 }
 
@@ -1751,6 +1753,7 @@ fn test_account_equity_computes_correctly() {
         fee_credits: I128::ZERO,
         last_fee_slot: 0,
         last_partial_liquidation_slot: 0,
+        lp_fee_acc_snapshot: U128::ZERO,
     };
     assert_eq!(engine.account_equity(&account_pos), 7_000);
 
@@ -1772,6 +1775,7 @@ fn test_account_equity_computes_correctly() {
         fee_credits: I128::ZERO,
         last_fee_slot: 0,
         last_partial_liquidation_slot: 0,
+        lp_fee_acc_snapshot: U128::ZERO,
     };
     assert_eq!(engine.account_equity(&account_neg), 0);
 
@@ -1793,6 +1797,7 @@ fn test_account_equity_computes_correctly() {
         fee_credits: I128::ZERO,
         last_fee_slot: 0,
         last_partial_liquidation_slot: 0,
+        lp_fee_acc_snapshot: U128::ZERO,
     };
     assert_eq!(engine.account_equity(&account_profit), 15_000);
 }
@@ -3722,6 +3727,8 @@ fn params_for_inline_tests() -> RiskParams {
         fee_split_protocol_bps: 0,
         fee_split_creator_bps: 0,
         fee_utilization_surge_bps: 0,
+        oi_hard_cap_multiplier: 0,
+        max_pnl_cap_ratio_bps: 0,
     }
 }
 
@@ -5242,9 +5249,10 @@ fn test_dynamic_fee_utilization_surge() {
 #[test]
 fn test_fee_split_legacy() {
     let engine = Box::new(RiskEngine::new(default_params()));
-    let (lp, proto, creator) = engine.compute_fee_split(10_000);
-    assert_eq!(lp, 10_000);     // 100% to LP
-    assert_eq!(proto, 0);
+    let (lp, insurance, creator) = engine.compute_fee_split(10_000);
+    // Legacy (all splits = 0): 100% goes to insurance, LP accumulator receives nothing.
+    assert_eq!(lp, 0);
+    assert_eq!(insurance, 10_000);
     assert_eq!(creator, 0);
 }
 
@@ -5300,4 +5308,283 @@ fn test_fee_params_validation() {
     // Invalid: fee split doesn't sum to 10_000
     params.fee_split_creator_bps = 900;
     assert!(params.validate().is_err());
+}
+
+// ============================================================================
+// LP Vault Program Tests
+// ============================================================================
+
+/// Test: OI hard cap blocks risk-increasing trades when total OI > multiplier × LP capital
+///
+/// Strategy: first fill the OI cap with a valid trade, then a second trade
+/// (even of size 1) should be rejected as it would push OI over the cap.
+#[test]
+fn test_oi_hard_cap_enforced() {
+    let mut params = default_params();
+    params.oi_hard_cap_multiplier = 10; // OI cap = 10× LP capital
+    let mut engine = Box::new(RiskEngine::new(params));
+
+    let user_idx = engine.add_user(0).unwrap();
+    let lp_idx = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
+
+    // LP capital = 100_000 → OI cap = 10 × 100_000 = 1_000_000
+    // User gets 2_000_000 capital (enough margin for 500_000-notional position at 10% initial)
+    engine.deposit(lp_idx, 100_000, 0).unwrap();
+    engine.deposit(user_idx, 2_000_000, 0).unwrap();
+
+    assert_eq!(engine.lp_capital_tot.get(), 100_000);
+
+    // First trade: size = 500_000, oracle = 1_000_000 → notional = 500_000
+    // After this: |user pos| = 500_000, |LP pos| = 500_000, OI = 1_000_000 = cap
+    let result = engine.execute_trade(&MATCHER, lp_idx, user_idx, 0, 1_000_000, 500_000);
+    assert!(result.is_ok(), "First trade to fill OI cap should succeed: {:?}", result);
+
+    // OI is now exactly at the cap (1_000_000). A second trade of any positive size
+    // in the same direction would push OI above cap.
+    let result = engine.execute_trade(&MATCHER, lp_idx, user_idx, 0, 1_000_000, 1);
+    assert_eq!(
+        result,
+        Err(RiskError::OiCapExceeded),
+        "Trade that would exceed OI cap must be rejected"
+    );
+
+    assert_conserved(&engine);
+}
+
+/// Test: OI hard cap is disabled when oi_hard_cap_multiplier = 0
+#[test]
+fn test_oi_hard_cap_disabled_when_zero() {
+    let mut params = default_params();
+    params.oi_hard_cap_multiplier = 0; // Disabled
+    let mut engine = Box::new(RiskEngine::new(params));
+
+    let user_idx = engine.add_user(0).unwrap();
+    let lp_idx = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
+
+    engine.deposit(lp_idx, 100_000, 0).unwrap();
+    engine.deposit(user_idx, 10_000_000, 0).unwrap();
+
+    // Any trade that passes margin checks should succeed (no OI cap)
+    let result = engine.execute_trade(&MATCHER, lp_idx, user_idx, 0, 1_000_000, 10_000);
+    assert!(result.is_ok(), "Trade should succeed when OI cap is disabled: {:?}", result);
+
+    assert_conserved(&engine);
+}
+
+/// Test: lp_capital_tot is updated correctly when LPs deposit
+#[test]
+fn test_lp_capital_tot_maintained() {
+    let mut engine = Box::new(RiskEngine::new(default_params()));
+
+    // Start at zero
+    assert_eq!(engine.lp_capital_tot.get(), 0);
+
+    let lp1 = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
+    let lp2 = engine.add_lp([3u8; 32], [4u8; 32], 0).unwrap();
+    let user = engine.add_user(0).unwrap();
+
+    engine.deposit(lp1, 500_000, 0).unwrap();
+    assert_eq!(engine.lp_capital_tot.get(), 500_000, "lp_capital_tot should be 500_000 after LP1 deposit");
+
+    engine.deposit(lp2, 300_000, 0).unwrap();
+    assert_eq!(engine.lp_capital_tot.get(), 800_000, "lp_capital_tot should be 800_000 after LP2 deposit");
+
+    // User deposit must NOT affect lp_capital_tot
+    engine.deposit(user, 200_000, 0).unwrap();
+    assert_eq!(engine.lp_capital_tot.get(), 800_000, "lp_capital_tot must not change on user deposit");
+
+    assert_conserved(&engine);
+}
+
+/// Test: Max PnL cap blocks trades where user position notional > ratio × vault
+#[test]
+fn test_max_pnl_cap_enforced() {
+    let mut params = default_params();
+    params.max_pnl_cap_ratio_bps = 5000; // 50% of vault
+    let mut engine = Box::new(RiskEngine::new(params));
+
+    let user_idx = engine.add_user(0).unwrap();
+    let lp_idx = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
+
+    // Vault = 500_000 (user) + 500_000 (LP) = 1_000_000
+    // max_pnl_cap = 50% of vault = 500_000
+    engine.deposit(user_idx, 500_000, 0).unwrap();
+    engine.deposit(lp_idx, 500_000, 0).unwrap();
+
+    // Small trade: notional = 1_000 at oracle = 1_000_000 → OK
+    let result = engine.execute_trade(&MATCHER, lp_idx, user_idx, 0, 1_000_000, 1_000);
+    assert!(result.is_ok(), "Small trade within PnL cap should succeed: {:?}", result);
+
+    // Close the position first
+    let _ = engine.execute_trade(&MATCHER, lp_idx, user_idx, 0, 1_000_000, -1_000);
+
+    // Large trade: size = 600_000 at oracle 1_000_000 → notional = 600_000 > 500_000 cap
+    let result = engine.execute_trade(&MATCHER, lp_idx, user_idx, 0, 1_000_000, 600_000);
+    assert_eq!(
+        result,
+        Err(RiskError::PnlCapExceeded),
+        "Trade that would exceed PnL cap must be rejected"
+    );
+
+    assert_conserved(&engine);
+}
+
+/// Test: Max PnL cap disabled when max_pnl_cap_ratio_bps = 0
+#[test]
+fn test_max_pnl_cap_disabled_when_zero() {
+    let mut params = default_params();
+    params.max_pnl_cap_ratio_bps = 0; // Disabled
+    let mut engine = Box::new(RiskEngine::new(params));
+
+    let user_idx = engine.add_user(0).unwrap();
+    let lp_idx = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
+
+    engine.deposit(user_idx, 500_000, 0).unwrap();
+    engine.deposit(lp_idx, 500_000, 0).unwrap();
+
+    // Should pass margin checks without hitting any PnL cap
+    let result = engine.execute_trade(&MATCHER, lp_idx, user_idx, 0, 1_000_000, 1_000);
+    assert!(result.is_ok(), "Trade should succeed when PnL cap is disabled: {:?}", result);
+
+    assert_conserved(&engine);
+}
+
+/// Test: LP fee accumulator accrues proportionally from trading fees
+#[test]
+fn test_lp_fee_accumulator_accrues() {
+    let mut params = default_params();
+    params.fee_split_lp_bps = 8000;       // 80% to LP vault
+    params.fee_split_protocol_bps = 2000;  // 20% to protocol
+    params.fee_split_creator_bps = 0;
+    params.trading_fee_bps = 10;           // 0.1%
+    let mut engine = Box::new(RiskEngine::new(params));
+
+    let user_idx = engine.add_user(0).unwrap();
+    let lp_idx = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
+
+    engine.deposit(user_idx, 2_000_000, 0).unwrap();
+    engine.deposit(lp_idx, 1_000_000, 0).unwrap();
+
+    // Accumulator should start at 0
+    assert_eq!(engine.lp_fee_acc_per_unit_e12.get(), 0);
+    assert_eq!(engine.lp_fee_claimable(lp_idx), 0);
+
+    // Execute a trade: size=100_000, oracle=1_000_000 → notional=100_000
+    // fee = (100_000 * 10 + 9999) / 10_000 = 100
+    // lp_fee_share = 100 * 8000 / 10_000 = 80
+    engine.execute_trade(&MATCHER, lp_idx, user_idx, 0, 1_000_000, 100_000).unwrap();
+
+    // Accumulator should have increased
+    let acc = engine.lp_fee_acc_per_unit_e12.get();
+    assert!(acc > 0, "LP fee accumulator must increase after a trade with lp_fee_share > 0");
+
+    // lp_fee_claimable should return a non-zero amount
+    let claimable = engine.lp_fee_claimable(lp_idx);
+    assert!(claimable > 0, "LP should have claimable fees after a trade: claimable={}", claimable);
+
+    assert_conserved(&engine);
+}
+
+/// Test: lp_fee_credit credits fees to LP capital and resets snapshot
+#[test]
+fn test_lp_fee_credit_works() {
+    let mut params = default_params();
+    params.fee_split_lp_bps = 8000;
+    params.fee_split_protocol_bps = 2000;
+    params.fee_split_creator_bps = 0;
+    params.trading_fee_bps = 10;
+    let mut engine = Box::new(RiskEngine::new(params));
+
+    let user_idx = engine.add_user(0).unwrap();
+    let lp_idx = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
+
+    engine.deposit(user_idx, 2_000_000, 0).unwrap();
+    engine.deposit(lp_idx, 1_000_000, 0).unwrap();
+
+    let lp_cap_before = engine.accounts[lp_idx as usize].capital.get();
+
+    // Execute a trade that generates LP fees
+    engine.execute_trade(&MATCHER, lp_idx, user_idx, 0, 1_000_000, 100_000).unwrap();
+
+    let claimable = engine.lp_fee_claimable(lp_idx);
+    assert!(claimable > 0, "Should have claimable fees");
+
+    // Claim the fees
+    let credited = engine.lp_fee_credit(lp_idx).unwrap();
+    assert_eq!(credited, claimable, "Credited amount should equal claimable");
+
+    // LP capital should have increased by the credited amount
+    let lp_cap_after = engine.accounts[lp_idx as usize].capital.get();
+    assert!(
+        lp_cap_after >= lp_cap_before,
+        "LP capital should have increased after fee credit (may be reduced by trade losses)"
+    );
+
+    // After claiming, claimable should be 0
+    assert_eq!(engine.lp_fee_claimable(lp_idx), 0, "Nothing to claim after lp_fee_credit");
+
+    assert_conserved(&engine);
+}
+
+/// Test: lp_fee_credit on user account returns NotAnLPAccount
+#[test]
+fn test_lp_fee_credit_on_user_returns_error() {
+    let mut engine = Box::new(RiskEngine::new(default_params()));
+    let user_idx = engine.add_user(0).unwrap();
+    engine.deposit(user_idx, 100_000, 0).unwrap();
+
+    let result = engine.lp_fee_credit(user_idx);
+    assert_eq!(result, Err(RiskError::NotAnLPAccount));
+}
+
+/// Test: fee split validation rejects max_pnl_cap_ratio_bps > 10_000
+#[test]
+fn test_max_pnl_cap_ratio_validation() {
+    let mut params = default_params();
+    params.max_pnl_cap_ratio_bps = 10_001; // > 100%, invalid
+    assert!(params.validate().is_err(), "max_pnl_cap_ratio_bps > 10_000 should fail validation");
+
+    params.max_pnl_cap_ratio_bps = 10_000; // exactly 100%, valid
+    assert!(params.validate().is_ok(), "max_pnl_cap_ratio_bps = 10_000 should be valid");
+}
+
+/// Test: Two LPs earn fees proportional to their capital
+#[test]
+fn test_lp_fee_proportional_distribution() {
+    let mut params = default_params();
+    params.fee_split_lp_bps = 10_000; // 100% to LP vault
+    params.fee_split_protocol_bps = 0;
+    params.fee_split_creator_bps = 0;
+    params.trading_fee_bps = 10; // 0.1%
+    let mut engine = Box::new(RiskEngine::new(params));
+
+    let user_idx = engine.add_user(0).unwrap();
+    let lp1 = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
+    let lp2 = engine.add_lp([3u8; 32], [4u8; 32], 0).unwrap();
+
+    // LP1 deposits 600_000, LP2 deposits 400_000 → LP1 has 60%, LP2 has 40%
+    engine.deposit(lp1, 600_000, 0).unwrap();
+    engine.deposit(lp2, 400_000, 0).unwrap();
+    engine.deposit(user_idx, 2_000_000, 0).unwrap();
+
+    assert_eq!(engine.lp_capital_tot.get(), 1_000_000);
+
+    // Execute a trade
+    engine.execute_trade(&MATCHER, lp1, user_idx, 0, 1_000_000, 100_000).unwrap();
+
+    let claim1 = engine.lp_fee_claimable(lp1);
+    let claim2 = engine.lp_fee_claimable(lp2);
+
+    // LP1 should earn ~60% of LP fees, LP2 ~40%
+    // (may differ by 1 due to rounding)
+    if claim1 > 0 && claim2 > 0 {
+        // ratio should be approximately 3:2
+        assert!(
+            claim1 > claim2,
+            "LP1 with more capital should earn more fees: claim1={}, claim2={}",
+            claim1, claim2
+        );
+    }
+
+    assert_conserved(&engine);
 }

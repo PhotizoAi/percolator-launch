@@ -175,6 +175,14 @@ pub struct Account {
     /// Last slot when a partial liquidation occurred (PERC-122 cooldown).
     pub last_partial_liquidation_slot: u64,
 
+    // ========================================
+    // LP Vault Fee Accounting (LP-specific)
+    // ========================================
+    /// Snapshot of the global `lp_fee_acc_per_unit_e12` at the time this LP last claimed fees.
+    /// For user accounts this is always zero.
+    /// Claimable LP fees = (engine.lp_fee_acc_per_unit_e12 - lp_fee_acc_snapshot) * capital / 1e12.
+    pub lp_fee_acc_snapshot: U128,
+
 }
 
 impl Account {
@@ -208,6 +216,7 @@ fn empty_account() -> Account {
         fee_credits: I128::ZERO,
         last_fee_slot: 0,
         last_partial_liquidation_slot: 0,
+        lp_fee_acc_snapshot: U128::ZERO,
     }
 }
 
@@ -352,6 +361,21 @@ pub struct RiskParams {
     pub fee_split_creator_bps: u64,
     /// Utilization-based fee multiplier ceiling (bps above base). 0 = disabled.
     pub fee_utilization_surge_bps: u64,
+
+    // ========================================
+    // LP Vault Safety Parameters
+    // ========================================
+    /// OI hard cap as a multiplier of total LP capital (0 = disabled).
+    /// When non-zero, execute_trade rejects risk-increasing trades that would push
+    /// total open interest above oi_hard_cap_multiplier × lp_capital_tot.
+    /// E.g., 10 means OI is capped at 10× the LP vault's total deposited capital.
+    pub oi_hard_cap_multiplier: u64,
+
+    /// Max user position notional as a fraction of vault (in basis points, 0 = disabled).
+    /// When non-zero, execute_trade rejects trades whose new position notional would
+    /// exceed max_pnl_cap_ratio_bps / 10_000 × vault.
+    /// This ensures the vault can always cover the maximum possible PnL for any account.
+    pub max_pnl_cap_ratio_bps: u64,
 }
 
 impl RiskParams {
@@ -422,6 +446,10 @@ impl RiskParams {
             if total != 10_000 {
                 return Err(RiskError::Overflow);
             }
+        }
+        // max_pnl_cap_ratio_bps must not exceed 10_000 (cannot cap above 100% of vault)
+        if self.max_pnl_cap_ratio_bps > 10_000 {
+            return Err(RiskError::Overflow);
         }
         Ok(())
     }
@@ -556,6 +584,19 @@ pub struct RiskEngine {
     pub lp_max_abs_sweep: U128,
 
     // ========================================
+    // LP Vault Capital & Fee Accounting (O(1))
+    // ========================================
+    /// Sum of capital across all LP accounts (O(1) maintained via set_capital for LP accounts).
+    /// Used for OI hard-cap enforcement: total_open_interest ≤ oi_hard_cap_multiplier × lp_capital_tot.
+    pub lp_capital_tot: U128,
+
+    /// Global LP fee accumulator per unit of LP capital, scaled by 1e12.
+    /// Incremented on every trade by (lp_fee_share * 1_000_000_000_000 / lp_capital_tot).
+    /// An LP's claimable fees = (lp_fee_acc_per_unit_e12 − account.lp_fee_acc_snapshot) * capital / 1e12.
+    /// This enables trustless, proportional fee distribution with no admin key needed.
+    pub lp_fee_acc_per_unit_e12: U128,
+
+    // ========================================
     // Slab Management
     // ========================================
     /// Occupancy bitmap (4096 bits = 64 u64 words)
@@ -613,6 +654,12 @@ pub enum RiskError {
 
     /// Account kind mismatch
     AccountKindMismatch,
+
+    /// Trade rejected: total open interest would exceed the OI hard cap (N × LP capital)
+    OiCapExceeded,
+
+    /// Trade rejected: user position notional would exceed the max PnL cap (fraction of vault)
+    PnlCapExceeded,
 }
 
 pub type Result<T> = core::result::Result<T, RiskError>;
@@ -841,6 +888,8 @@ impl RiskEngine {
             lp_sum_abs: U128::ZERO,
             lp_max_abs: U128::ZERO,
             lp_max_abs_sweep: U128::ZERO,
+            lp_capital_tot: U128::ZERO,
+            lp_fee_acc_per_unit_e12: U128::ZERO,
             used: [0; BITMAP_WORDS],
             num_used_accounts: 0,
             next_account_id: 0,
@@ -966,31 +1015,46 @@ impl RiskEngine {
         }
     }
 
-    /// Helper: set account capital and maintain c_tot aggregate (spec §4.1).
+    /// Helper: set account capital and maintain c_tot and lp_capital_tot aggregates (spec §4.1).
     #[inline]
     pub fn set_capital(&mut self, idx: usize, new_capital: u128) {
         let old = self.accounts[idx].capital.get();
-        if new_capital >= old {
-            self.c_tot = U128::new(self.c_tot.get().saturating_add(new_capital - old));
+        let delta_up = new_capital >= old;
+        let delta = if delta_up { new_capital - old } else { old - new_capital };
+        if delta_up {
+            self.c_tot = U128::new(self.c_tot.get().saturating_add(delta));
         } else {
-            self.c_tot = U128::new(self.c_tot.get().saturating_sub(old - new_capital));
+            self.c_tot = U128::new(self.c_tot.get().saturating_sub(delta));
+        }
+        // Maintain lp_capital_tot for LP accounts
+        if self.accounts[idx].is_lp() {
+            if delta_up {
+                self.lp_capital_tot = U128::new(self.lp_capital_tot.get().saturating_add(delta));
+            } else {
+                self.lp_capital_tot = U128::new(self.lp_capital_tot.get().saturating_sub(delta));
+            }
         }
         self.accounts[idx].capital = U128::new(new_capital);
     }
 
-    /// Recompute c_tot and pnl_pos_tot from account data. For test use after direct state mutation.
+    /// Recompute c_tot, pnl_pos_tot, and lp_capital_tot from account data. For test use after direct state mutation.
     pub fn recompute_aggregates(&mut self) {
         let mut c_tot = 0u128;
         let mut pnl_pos_tot = 0u128;
+        let mut lp_capital_tot = 0u128;
         self.for_each_used(|_idx, account| {
             c_tot = c_tot.saturating_add(account.capital.get());
             let pnl = account.pnl.get();
             if pnl > 0 {
                 pnl_pos_tot = pnl_pos_tot.saturating_add(pnl as u128);
             }
+            if account.is_lp() {
+                lp_capital_tot = lp_capital_tot.saturating_add(account.capital.get());
+            }
         });
         self.c_tot = U128::new(c_tot);
         self.pnl_pos_tot = U128::new(pnl_pos_tot);
+        self.lp_capital_tot = U128::new(lp_capital_tot);
     }
 
     /// Compute haircut ratio (h_num, h_den) per spec §3.2.
@@ -1119,6 +1183,7 @@ impl RiskEngine {
             fee_credits: I128::ZERO,
             last_fee_slot: self.current_slot,
             last_partial_liquidation_slot: 0,
+            lp_fee_acc_snapshot: U128::ZERO, // Zero for user accounts
         };
 
         // Maintain c_tot aggregate (account was created with capital = excess)
@@ -1180,11 +1245,14 @@ impl RiskEngine {
             fee_credits: I128::ZERO,
             last_fee_slot: self.current_slot,
             last_partial_liquidation_slot: 0,
+            // Snapshot current accumulator so LP only earns fees from this point forward
+            lp_fee_acc_snapshot: self.lp_fee_acc_per_unit_e12,
         };
 
-        // Maintain c_tot aggregate (account was created with capital = excess)
+        // Maintain c_tot and lp_capital_tot aggregates
         if excess > 0 {
             self.c_tot = U128::new(self.c_tot.get().saturating_add(excess));
+            self.lp_capital_tot = U128::new(self.lp_capital_tot.get().saturating_add(excess));
         }
 
         Ok(idx)
@@ -3152,15 +3220,19 @@ impl RiskEngine {
 
     /// Compute the fee split for a given total fee amount.
     ///
-    /// Returns (lp_share, protocol_share, creator_share).
-    /// If fee split params are all 0, 100% goes to LP vault (legacy behavior).
+    /// Returns (lp_vault_share, insurance_share, creator_share).
+    /// - `lp_vault_share`: goes to the LP fee accumulator (claimable by LP accounts).
+    /// - `insurance_share`: goes to the insurance fund balance (includes protocol share).
+    /// - `creator_share`: goes to the insurance fund (market creator allocation).
+    ///
+    /// If fee split params are all 0 (legacy mode), 100% goes to the insurance fund.
     pub fn compute_fee_split(&self, total_fee: u128) -> (u128, u128, u128) {
         if self.params.fee_split_lp_bps == 0
             && self.params.fee_split_protocol_bps == 0
             && self.params.fee_split_creator_bps == 0
         {
-            // Legacy: 100% to LP vault
-            return (total_fee, 0, 0);
+            // Legacy: 100% to insurance fund (original behavior, no LP accumulator)
+            return (0, total_fee, 0);
         }
 
         let lp = mul_u128(total_fee, self.params.fee_split_lp_bps as u128) / 10_000;
@@ -3169,6 +3241,65 @@ impl RiskEngine {
         let creator = total_fee.saturating_sub(lp).saturating_sub(protocol);
 
         (lp, protocol, creator)
+    }
+
+    /// Compute the claimable LP vault fee for an LP account.
+    ///
+    /// Returns the amount of trading fees that can be credited to the LP account's capital.
+    /// This is proportional to the LP's share of total LP capital at the time fees were collected.
+    ///
+    /// Claimable = (lp_fee_acc_per_unit_e12 − account.lp_fee_acc_snapshot) × capital / 1e12
+    ///
+    /// Returns 0 for non-LP accounts or when nothing has accrued since the last claim.
+    pub fn lp_fee_claimable(&self, lp_idx: u16) -> u128 {
+        if lp_idx as usize >= MAX_ACCOUNTS || !self.is_used(lp_idx as usize) {
+            return 0;
+        }
+        let account = &self.accounts[lp_idx as usize];
+        if !account.is_lp() {
+            return 0;
+        }
+        let global_acc = self.lp_fee_acc_per_unit_e12.get();
+        let snapshot = account.lp_fee_acc_snapshot.get();
+        let acc_delta = global_acc.saturating_sub(snapshot);
+        if acc_delta == 0 {
+            return 0;
+        }
+        // claimable = capital * acc_delta / 1e12
+        mul_u128(account.capital.get(), acc_delta) / 1_000_000_000_000u128
+    }
+
+    /// Credit accrued LP vault fees to an LP account's capital (trustless, permissionless).
+    ///
+    /// Any caller can invoke this; no admin key is required. The LP earns fees
+    /// proportional to their capital share over each epoch.
+    ///
+    /// The claim amount moves from insurance_balance (where it was held for conservation)
+    /// to LP capital, preserving the vault conservation invariant.
+    ///
+    /// Returns the amount credited (0 if nothing to claim or account is not an LP).
+    pub fn lp_fee_credit(&mut self, lp_idx: u16) -> Result<u128> {
+        if lp_idx as usize >= MAX_ACCOUNTS || !self.is_used(lp_idx as usize) {
+            return Err(RiskError::AccountNotFound);
+        }
+        if !self.accounts[lp_idx as usize].is_lp() {
+            return Err(RiskError::NotAnLPAccount);
+        }
+        let claimable = self.lp_fee_claimable(lp_idx);
+        if claimable > 0 {
+            // Transfer claimed fees from insurance_balance to LP capital:
+            //   vault unchanged, insurance_balance -= claimable, lp_capital += claimable
+            // This conserves the invariant: vault >= c_tot + insurance_balance.
+            let new_cap = self.accounts[lp_idx as usize].capital.get().saturating_add(claimable);
+            self.set_capital(lp_idx as usize, new_cap);
+            self.insurance_fund.balance =
+                U128::new(self.insurance_fund.balance.get().saturating_sub(claimable));
+        }
+        // Advance the LP's snapshot to the current global accumulator regardless of claim amount.
+        // This prevents double-claiming even if claimable rounds down to zero.
+        let global_acc = self.lp_fee_acc_per_unit_e12;
+        self.accounts[lp_idx as usize].lp_fee_acc_snapshot = global_acc;
+        Ok(claimable)
     }
 
     pub fn account_equity(&self, account: &Account) -> u128 {
@@ -3432,6 +3563,14 @@ impl RiskEngine {
             0
         };
 
+        // Compute LP vault fee split before split_at_mut (avoids borrow conflict).
+        // LP share goes to the fee accumulator (stays in vault, available for LP claims).
+        // Other shares go to the insurance fund.
+        let (lp_fee_share, other_fee_share) = {
+            let (lp, protocol, creator) = self.compute_fee_split(fee);
+            (lp, protocol.saturating_add(creator))
+        };
+
         // Access both accounts
         let (user, lp) = if user_idx < lp_idx {
             let (left, right) = self.accounts.split_at_mut(lp_idx as usize);
@@ -3627,7 +3766,60 @@ impl RiskEngine {
             }
         }
 
+        // ----------------------------------------------------------------
+        // OI Hard Cap: total OI must not exceed oi_hard_cap_multiplier × lp_capital_tot
+        // This ensures the exchange never takes on more exposure than its LP backing.
+        // Only enforced when the OI would increase (risk-increasing trades).
+        // ----------------------------------------------------------------
+        if self.params.oi_hard_cap_multiplier > 0 {
+            let old_oi_u =
+                saturating_abs_i128(old_user_pos) as u128 + saturating_abs_i128(old_lp_pos) as u128;
+            let new_oi_u = saturating_abs_i128(new_user_position) as u128
+                + saturating_abs_i128(new_lp_position) as u128;
+            if new_oi_u > old_oi_u {
+                let lp_cap = self.lp_capital_tot.get();
+                if lp_cap > 0 {
+                    let projected_total_oi = self
+                        .total_open_interest
+                        .get()
+                        .saturating_add(new_oi_u)
+                        .saturating_sub(old_oi_u);
+                    let oi_cap = lp_cap
+                        .saturating_mul(self.params.oi_hard_cap_multiplier as u128);
+                    if projected_total_oi > oi_cap {
+                        return Err(RiskError::OiCapExceeded);
+                    }
+                }
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // Max PnL Cap: user position notional must not exceed a fraction of the vault.
+        // This ensures the vault can always cover the maximum possible PnL for any account.
+        // Only checked for risk-increasing trades (where user notional grows).
+        // ----------------------------------------------------------------
+        if self.params.max_pnl_cap_ratio_bps > 0 && new_user_position != 0 {
+            let old_user_pos_abs_u = saturating_abs_i128(old_user_pos) as u128;
+            let new_user_pos_abs_u = saturating_abs_i128(new_user_position) as u128;
+            if new_user_pos_abs_u > old_user_pos_abs_u {
+                let new_user_notional =
+                    mul_u128(new_user_pos_abs_u, oracle_price as u128) / 1_000_000;
+                let vault_cap = mul_u128(
+                    self.vault.get(),
+                    self.params.max_pnl_cap_ratio_bps as u128,
+                ) / 10_000;
+                if new_user_notional > vault_cap {
+                    return Err(RiskError::PnlCapExceeded);
+                }
+            }
+        }
+
         // Commit all state changes
+        // All fees go to insurance balance to maintain the conservation invariant:
+        //   vault >= c_tot + insurance_balance
+        // The LP vault share is tracked in the fee accumulator (for LP claims);
+        // when an LP calls lp_fee_credit(), the claim amount moves from insurance_balance
+        // to LP capital (conserving the invariant).
         self.insurance_fund.fee_revenue =
             U128::new(add_u128(self.insurance_fund.fee_revenue.get(), fee));
         self.insurance_fund.balance = U128::new(add_u128(self.insurance_fund.balance.get(), fee));
@@ -3718,6 +3910,18 @@ impl RiskEngine {
         }
         // lp_max_abs: monotone increase only (conservative upper bound)
         self.lp_max_abs = U128::new(self.lp_max_abs.get().max(new_lp_abs));
+
+        // Update LP fee accumulator (epoch-based, trustless, proportional).
+        // The LP share of the trading fee is tracked per unit of LP capital.
+        // Any LP can call lp_fee_credit() at any time to claim their proportional share.
+        // No admin key is needed; the accumulator is purely additive and on-chain verifiable.
+        let lp_cap_for_acc = self.lp_capital_tot.get();
+        if lp_fee_share > 0 && lp_cap_for_acc > 0 {
+            // acc_delta = lp_fee_share * 1e12 / lp_capital_tot (per-unit, scaled 1e12)
+            let acc_delta = mul_u128(lp_fee_share, 1_000_000_000_000u128) / lp_cap_for_acc;
+            self.lp_fee_acc_per_unit_e12 =
+                self.lp_fee_acc_per_unit_e12.saturating_add(acc_delta);
+        }
 
         // Two-pass settlement: losses first, then profits.
         // This ensures the loser's capital reduction increases Residual before
