@@ -1,15 +1,15 @@
 # Security Dependency Risk Register
 
-> Last updated: 2026-02-20 (PERC-038)
+> Last updated: 2026-03-01 (PERC-audit-002)
 > Audited by: security agent
 
 ## Summary
 
 | Metric | Count |
 |--------|-------|
-| Total vulnerabilities (pre-remediation) | 7 |
+| Total vulnerabilities (pre-remediation) | 8 |
 | Fixed by dependency removal | 2 (elliptic, lodash) |
-| Fixed by pnpm override | 3 (minimatch ×3) |
+| Fixed by pnpm override | 4 (minimatch ×3, hono ×1) |
 | Fixed in prior PR | 1 (hono, PR #265) |
 | Remaining (risk accepted) | 2 |
 
@@ -43,6 +43,30 @@ Verified linting still passes with the override.
 ### 3. Hono upgrade (prior — PR #265)
 
 **Eliminated:** hono vulnerability (coder, Sprint 2)
+
+### 4. Overrode `hono` to ≥4.12.2
+
+**Eliminated:** hono Authentication Bypass by IP Spoofing in AWS Lambda ALB conninfo (HIGH)
+
+`hono@4.12.0` introduced a regression where the `conninfo` helper for AWS Lambda
+ALB incorrectly selected the first value from the `X-Forwarded-For` header as
+the client IP address. AWS ALB appends the real client IP at the *end* of that
+header, so an attacker could spoof their source IP on routes that call
+`getConnInfo(c)` to bypass IP-based access controls.
+
+- **Advisory:** [GHSA-xh87-mx6m-69f3](https://github.com/advisories/GHSA-xh87-mx6m-69f3) / CVE-2026-27700
+- **CVSS:** 8.2 (HIGH)
+- **Affected:** hono ≥4.12.0 <4.12.2
+- **Patched version:** 4.12.2 (deployed: 4.12.3)
+- **Affected packages:** `packages/api` and `packages/indexer`
+
+Added `"hono": ">=4.12.2"` to `pnpm.overrides` in root `package.json`.
+The lockfile now resolves `hono@4.12.3` across all workspace packages.
+
+**Note:** The rate-limit middleware in `packages/api/src/middleware/rate-limit.ts`
+already uses its own `getClientIp()` function (not Hono's `conninfo`), so the
+effective attack surface in this deployment was limited. The upgrade is still
+applied to eliminate the library-level vulnerability.
 
 ## Remaining Vulnerabilities — Risk Accepted
 
