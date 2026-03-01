@@ -26,6 +26,7 @@ import {
   createInitializeMintInstruction,
   createAssociatedTokenAccountInstruction,
   createMintToInstruction,
+  createTransferInstruction,
   getAssociatedTokenAddress,
   getMinimumBalanceForRentExemptMint,
   MINT_SIZE,
@@ -61,9 +62,12 @@ import {
   SLAB_TIERS,
 } from "../../packages/core/dist/index.js";
 
-const RPC = `https://devnet.helius-rpc.com/?api-key=${process.env.HELIUS_API_KEY ?? ""}`;
+const HELIUS_KEY = process.env.HELIUS_API_KEY;
+const RPC = HELIUS_KEY
+  ? `https://devnet.helius-rpc.com/?api-key=${HELIUS_KEY}`
+  : "https://api.devnet.solana.com";
 const PROGRAM_ID = new PublicKey("FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD");
-const MATCHER_PROGRAM_ID = new PublicKey("4HcGCsyjAqnFua5ccuXyt8KRRQzKFbGTJkVChpS7Yfzy");
+const MATCHER_PROGRAM_ID = new PublicKey("GTRgyTDfrMvBubALAqtHuQwT8tbGyXid7svXZKtWfC9k");
 const MATCHER_CTX_SIZE = 320;
 
 const conn = new Connection(RPC, "confirmed");
@@ -91,6 +95,7 @@ async function send(tx: Transaction, signers: Keypair[], label: string): Promise
 
 async function main() {
   console.log("🧪 E2E Devnet Test");
+  console.log(`   RPC: ${HELIUS_KEY ? "Helius (devnet)" : "Public Solana devnet"}`);
   console.log(`   Payer: ${payer.publicKey.toBase58()}`);
   console.log(`   Balance: ${(await conn.getBalance(payer.publicKey)) / LAMPORTS_PER_SOL} SOL`);
   console.log(`   Program: ${PROGRAM_ID.toBase58()}`);
@@ -150,6 +155,16 @@ async function main() {
   );
   await send(createVaultTx, [payer], `Vault ATA: ${vaultAta.toBase58().slice(0, 12)}...`);
 
+  // 4b. Seed deposit — program requires vault balance >= MIN_INIT_MARKET_SEED before InitMarket (#374)
+  console.log("Step 4b: Seed deposit to vault");
+  const MIN_INIT_MARKET_SEED = 500_000_000n; // protocol minimum vault balance for InitMarket
+  const SEED_AMOUNT = MIN_INIT_MARKET_SEED * 2n; // 1 token (9 decimals) — well above minimum
+  const seedTx = new Transaction().add(
+    ComputeBudgetProgram.setComputeUnitLimit({ units: 100_000 }),
+    createTransferInstruction(payerAta, vaultAta, payer.publicKey, SEED_AMOUNT)
+  );
+  await send(seedTx, [payer], `Seed deposit: ${SEED_AMOUNT} to vault`);
+
   // 5. InitMarket (admin oracle mode — all zeros feed)
   console.log("Step 5: InitMarket");
   const initMarketData = encodeInitMarket({
@@ -193,16 +208,22 @@ async function main() {
   const lpIdx = 0;
   const [lpPda] = deriveLpPda(PROGRAM_ID, slabKp.publicKey, lpIdx);
 
+  // feePayment must be >= newAccountFee (1_000_000) set in InitMarket
   const initLpData = encodeInitLP({
     matcherProgram: MATCHER_PROGRAM_ID,
     matcherContext: matcherCtxKp.publicKey,
-    feePayment: "0",
+    feePayment: "1000000",
   });
   const initLpKeys = buildAccountMetas(ACCOUNTS_INIT_LP, [
     payer.publicKey, slabKp.publicKey, payerAta, vaultAta, WELL_KNOWN.tokenProgram,
   ]);
 
-  // Step 6a: Create matcher context account
+  // Step 6a: Create matcher context account (owned by matcher program).
+  // The new reference AMM matcher (GTRgyTD...) does NOT require an InitVamm
+  // instruction — it only has one instruction (Tag 0, the CPI matcher call).
+  // The AMM reads LP config from the context account's user-data region
+  // (bytes 64..320) and falls back to defaults (30 bps spread, 100% fill)
+  // when the account is zeroed. So we just allocate it.
   const createMatcherTx = new Transaction().add(
     ComputeBudgetProgram.setComputeUnitLimit({ units: 50_000 }),
     SystemProgram.createAccount({
@@ -215,21 +236,7 @@ async function main() {
   );
   await send(createMatcherTx, [payer, matcherCtxKp], "Create matcher ctx");
 
-  // Step 6b: Init matcher context (Tag 1 = passthrough)
-  const initMatcherTx = new Transaction().add(
-    ComputeBudgetProgram.setComputeUnitLimit({ units: 50_000 }),
-    {
-      programId: MATCHER_PROGRAM_ID,
-      keys: [
-        { pubkey: lpPda, isSigner: false, isWritable: false },
-        { pubkey: matcherCtxKp.publicKey, isSigner: false, isWritable: true },
-      ],
-      data: Buffer.from([1]),
-    }
-  );
-  await send(initMatcherTx, [payer], "Init matcher ctx");
-
-  // Step 6c: Init LP in percolator
+  // Step 6b: Init LP in percolator
   const initLpTx = new Transaction().add(
     ComputeBudgetProgram.setComputeUnitLimit({ units: 100_000 }),
     ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50_000 }),
@@ -308,11 +315,11 @@ async function main() {
   console.log("Step 11: TradeCpi (open long)");
   const lpAccount = { owner: payer.publicKey, matcherProgram: MATCHER_PROGRAM_ID, matcherContext: matcherCtxKp.publicKey };
   const tradeData = encodeTradeCpi({ lpIdx: 0, userIdx: 1, size: (100_000_000n).toString() }); // 0.1 token notional
+  // PERC-199: clock sysvar removed from TradeCpi — program uses Clock::get() syscall
   const tradeKeys = buildAccountMetas(ACCOUNTS_TRADE_CPI, [
     payer.publicKey,
     lpAccount.owner,
     slabKp.publicKey,
-    WELL_KNOWN.clock,
     slabKp.publicKey, // oracle = slab for hyperp
     lpAccount.matcherProgram,
     lpAccount.matcherContext,

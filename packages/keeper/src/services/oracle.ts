@@ -5,7 +5,7 @@ import {
   buildIx,
   ACCOUNTS_PUSH_ORACLE_PRICE,
   type MarketConfig,
-} from "@percolator/core";
+} from "@percolator/sdk";
 import { config, getConnection, loadKeypair, sendWithRetry, eventBus, createLogger } from "@percolator/shared";
 
 const logger = createLogger("keeper:oracle");
@@ -288,7 +288,7 @@ export class OracleService {
 
     try {
       const connection = getConnection();
-      const keypair = loadKeypair(config.crankKeypair);
+      const keypair = loadKeypair(process.env.CRANK_KEYPAIR!);
       const slabPubkey = new PublicKey(slabAddress);
       const programId = marketProgramId ?? new PublicKey(config.programId);
 

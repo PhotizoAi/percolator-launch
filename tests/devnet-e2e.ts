@@ -8,7 +8,6 @@ import {
   encodeSetOracleAuthority,
   encodePushOraclePrice,
   encodeKeeperCrank,
-  encodeInitVamm,
   encodeInitLP,
   encodeDepositCollateral,
   encodeInitUser,
@@ -17,7 +16,6 @@ import {
   ACCOUNTS_SET_ORACLE_AUTHORITY,
   ACCOUNTS_PUSH_ORACLE_PRICE,
   ACCOUNTS_KEEPER_CRANK,
-  ACCOUNTS_INIT_VAMM,
   ACCOUNTS_INIT_LP,
   ACCOUNTS_DEPOSIT_COLLATERAL,
   ACCOUNTS_INIT_USER,
@@ -40,7 +38,7 @@ const RPC_URL = `https://devnet.helius-rpc.com/?api-key=${process.env.HELIUS_API
 // Use centralized config instead of hard-coded ID
 import { getProgramId } from "../packages/core/src/config/program-ids.js";
 const PROGRAM_ID = getProgramId("devnet");
-const MATCHER_ID = new PublicKey("4HcGCsyjAqnFua5ccuXyt8KRRQzKFbGTJkVChpS7Yfzy");
+const MATCHER_ID = new PublicKey("GTRgyTDfrMvBubALAqtHuQwT8tbGyXid7svXZKtWfC9k");
 const CRANK_WALLET = new PublicKey("2JaSzRYrf44fPpQBtRJfnCEgThwCmvpFd3FCXi45VXxm");
 const MINT = new PublicKey("DvH13uxzTzo1xVFwkbJ6YASkZWs6bm3vFDH4xu7kUYTs");
 const DEPLOYER_KP = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync("/tmp/deployer.json", "utf8"))));
@@ -150,11 +148,8 @@ async function main() {
     programId: MATCHER_ID,
   });
 
-  const initVammData = encodeInitVamm({});
-  const initVammKeys = buildAccountMetas(ACCOUNTS_INIT_VAMM, [
-    DEPLOYER_KP.publicKey, matcherCtxKeypair.publicKey,
-  ]);
-  const initVammIx = buildIx({ programId: MATCHER_ID, keys: initVammKeys, data: initVammData });
+  // NOTE: The new reference AMM matcher does NOT have an InitVamm instruction.
+  // It reads LP config from context bytes 64..68, using defaults when zeroed.
 
   const userAta = await getAta(DEPLOYER_KP.publicKey, MINT);
   const initLpData = encodeInitLP({ feePayment: "1000000" });
@@ -165,7 +160,7 @@ async function main() {
   ]);
   const initLpIx = buildIx({ programId: PROGRAM_ID, keys: initLpKeys, data: initLpData });
 
-  sig = await sendTx([createMatcherIx, initVammIx, initLpIx], [DEPLOYER_KP, matcherCtxKeypair]);
+  sig = await sendTx([createMatcherIx, initLpIx], [DEPLOYER_KP, matcherCtxKeypair]);
   console.log(`✅ Step 3 OK: ${sig}`);
 
   // Step 4: Deposit + Insurance + Delegate to crank
@@ -245,7 +240,6 @@ async function main() {
     DEPLOYER_KP.publicKey,
     lpAccount.account.owner,
     slabKeypair.publicKey,
-    WELL_KNOWN.clock,
     slabKeypair.publicKey, // oracle = slab for admin oracle
     lpAccount.account.matcherProgram,
     lpAccount.account.matcherContext,

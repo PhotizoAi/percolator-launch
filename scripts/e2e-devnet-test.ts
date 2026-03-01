@@ -26,6 +26,7 @@ import {
   createInitializeMintInstruction,
   createAssociatedTokenAccountInstruction,
   createMintToInstruction,
+  createTransferInstruction,
   getAssociatedTokenAddress,
   getMinimumBalanceForRentExemptMint,
   MINT_SIZE,
@@ -59,11 +60,14 @@ import {
   deriveVaultAuthority,
   deriveLpPda,
   SLAB_TIERS,
-} from "@percolator/core";
+} from "@percolator/sdk";
 
-const RPC = `https://devnet.helius-rpc.com/?api-key=${process.env.HELIUS_API_KEY ?? ""}`;
+const HELIUS_KEY = process.env.HELIUS_API_KEY;
+const RPC = HELIUS_KEY
+  ? `https://devnet.helius-rpc.com/?api-key=${HELIUS_KEY}`
+  : "https://api.devnet.solana.com";
 const PROGRAM_ID = new PublicKey("FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD");
-const MATCHER_PROGRAM_ID = new PublicKey("4HcGCsyjAqnFua5ccuXyt8KRRQzKFbGTJkVChpS7Yfzy");
+const MATCHER_PROGRAM_ID = new PublicKey("GTRgyTDfrMvBubALAqtHuQwT8tbGyXid7svXZKtWfC9k");
 const MATCHER_CTX_SIZE = 320;
 
 const conn = new Connection(RPC, "confirmed");
@@ -91,6 +95,7 @@ async function send(tx: Transaction, signers: Keypair[], label: string): Promise
 
 async function main() {
   console.log("🧪 E2E Devnet Test");
+  console.log(`   RPC: ${HELIUS_KEY ? "Helius (devnet)" : "Public Solana devnet"}`);
   console.log(`   Payer: ${payer.publicKey.toBase58()}`);
   console.log(`   Balance: ${(await conn.getBalance(payer.publicKey)) / LAMPORTS_PER_SOL} SOL`);
   console.log(`   Program: ${PROGRAM_ID.toBase58()}`);
@@ -122,9 +127,12 @@ async function main() {
   );
   await send(mintToTx, [payer], `Minted 1M tokens to ${payerAta.toBase58().slice(0, 12)}...`);
 
-  // 3. Create slab account (micro tier — cheapest)
+  // 3. Create slab account
+  // PERC-277: The devnet program FxfD37... is compiled with default features (MAX_ACCOUNTS=4096).
+  // Its hardcoded SLAB_LEN = 1,025,568 bytes. Using any other tier size causes error 0x4
+  // (InvalidSlabLen). Must match the program's compiled MAX_ACCOUNTS.
   console.log("Step 3: Create slab");
-  const tier = SLAB_TIERS.micro;
+  const tier = SLAB_TIERS.large;
   const slabKp = Keypair.generate();
   const slabRent = await conn.getMinimumBalanceForRentExemption(tier.dataSize);
   console.log(`   Slab rent: ${slabRent / LAMPORTS_PER_SOL} SOL (${tier.label}, ${tier.dataSize} bytes)`);
@@ -150,6 +158,15 @@ async function main() {
   );
   await send(createVaultTx, [payer], `Vault ATA: ${vaultAta.toBase58().slice(0, 12)}...`);
 
+  // 4b. Seed deposit — program requires vault balance >= 500_000_000 before InitMarket (#374)
+  console.log("Step 4b: Seed deposit to vault");
+  const SEED_AMOUNT = 1_000_000_000n; // 1 token (9 decimals) — well above 500M minimum
+  const seedTx = new Transaction().add(
+    ComputeBudgetProgram.setComputeUnitLimit({ units: 100_000 }),
+    createTransferInstruction(payerAta, vaultAta, payer.publicKey, SEED_AMOUNT)
+  );
+  await send(seedTx, [payer], `Seed deposit: ${SEED_AMOUNT} to vault`);
+
   // 5. InitMarket (admin oracle mode — all zeros feed)
   console.log("Step 5: InitMarket");
   const initMarketData = encodeInitMarket({
@@ -165,7 +182,7 @@ async function main() {
     maintenanceMarginBps: "500",
     initialMarginBps: "1000",
     tradingFeeBps: "30",
-    maxAccounts: tier.maxAccounts.toString(),
+    maxAccounts: tier.maxAccounts.toString(),  // Must match program's compiled MAX_ACCOUNTS
     newAccountFee: "1000000",
     riskReductionThreshold: "0",
     maintenanceFeePerSlot: "0",
@@ -177,7 +194,7 @@ async function main() {
   });
   const initMarketKeys = buildAccountMetas(ACCOUNTS_INIT_MARKET, [
     payer.publicKey, slabKp.publicKey, mintKp.publicKey, vaultAta,
-    WELL_KNOWN.tokenProgram, WELL_KNOWN.clock, WELL_KNOWN.rent, vaultAta, WELL_KNOWN.systemProgram,
+    WELL_KNOWN.tokenProgram, WELL_KNOWN.clock, WELL_KNOWN.rent, vaultPda, WELL_KNOWN.systemProgram,
   ]);
   const initMarketTx = new Transaction().add(
     ComputeBudgetProgram.setComputeUnitLimit({ units: 200_000 }),
@@ -193,39 +210,41 @@ async function main() {
   const lpIdx = 0;
   const [lpPda] = deriveLpPda(PROGRAM_ID, slabKp.publicKey, lpIdx);
 
+  // feePayment must be >= newAccountFee (1_000_000) set in InitMarket
   const initLpData = encodeInitLP({
     matcherProgram: MATCHER_PROGRAM_ID,
     matcherContext: matcherCtxKp.publicKey,
-    feePayment: "0",
+    feePayment: "1000000",
   });
   const initLpKeys = buildAccountMetas(ACCOUNTS_INIT_LP, [
     payer.publicKey, slabKp.publicKey, payerAta, vaultAta, WELL_KNOWN.tokenProgram,
   ]);
 
-  const initLpTx = new Transaction().add(
-    ComputeBudgetProgram.setComputeUnitLimit({ units: 300_000 }),
-    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50_000 }),
-    // Create matcher ctx account
+  // Create matcher context account (owned by matcher program).
+  // The new reference AMM matcher (GTRgyTD...) does NOT require an InitVamm
+  // instruction — it only has one instruction (Tag 0, the CPI matcher call).
+  // The AMM reads LP config from the context account's user-data region
+  // (bytes 64..320) and falls back to defaults (30 bps spread, 100% fill)
+  // when the account is zeroed. So we just allocate it.
+  const createMatcherTx = new Transaction().add(
+    ComputeBudgetProgram.setComputeUnitLimit({ units: 50_000 }),
     SystemProgram.createAccount({
       fromPubkey: payer.publicKey,
       newAccountPubkey: matcherCtxKp.publicKey,
       lamports: matcherRent,
       space: MATCHER_CTX_SIZE,
       programId: MATCHER_PROGRAM_ID,
-    }),
-    // Init matcher context (Tag 1 = passthrough)
-    {
-      programId: MATCHER_PROGRAM_ID,
-      keys: [
-        { pubkey: lpPda, isSigner: false, isWritable: false },
-        { pubkey: matcherCtxKp.publicKey, isSigner: false, isWritable: true },
-      ],
-      data: Buffer.from([1]),
-    },
-    // Init LP in percolator
+    })
+  );
+  await send(createMatcherTx, [payer, matcherCtxKp], "Create matcher ctx");
+
+  // Init LP in percolator
+  const initLpTx = new Transaction().add(
+    ComputeBudgetProgram.setComputeUnitLimit({ units: 200_000 }),
+    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50_000 }),
     buildIx({ programId: PROGRAM_ID, keys: initLpKeys, data: initLpData })
   );
-  await send(initLpTx, [payer, matcherCtxKp], "InitLP + matcher");
+  await send(initLpTx, [payer], "InitLP");
 
   // 7. Deposit collateral + TopUp insurance
   console.log("Step 7: Deposit + Insurance");
@@ -298,11 +317,11 @@ async function main() {
   console.log("Step 11: TradeCpi (open long)");
   const lpAccount = { owner: payer.publicKey, matcherProgram: MATCHER_PROGRAM_ID, matcherContext: matcherCtxKp.publicKey };
   const tradeData = encodeTradeCpi({ lpIdx: 0, userIdx: 1, size: (100_000_000n).toString() }); // 0.1 token notional
+  // PERC-199: clock sysvar removed from TradeCpi — program uses Clock::get() syscall
   const tradeKeys = buildAccountMetas(ACCOUNTS_TRADE_CPI, [
     payer.publicKey,
     lpAccount.owner,
     slabKp.publicKey,
-    WELL_KNOWN.clock,
     slabKp.publicKey, // oracle = slab for hyperp
     lpAccount.matcherProgram,
     lpAccount.matcherContext,

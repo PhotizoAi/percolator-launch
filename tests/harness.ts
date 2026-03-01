@@ -2,7 +2,7 @@
  * Devnet Integration Test Harness for Percolator Launch
  *
  * Adapted from MidTermDev/percolator-sov test harness.
- * Uses @percolator/core for all on-chain interactions.
+ * Uses @percolator/sdk for all on-chain interactions.
  *
  * Provides:
  * - Fresh market creation per test
@@ -52,7 +52,7 @@ import {
   encodePushOraclePrice,
   encodeSetOracleAuthority,
   type InitMarketArgs,
-} from "@percolator/core";
+} from "@percolator/sdk";
 
 import {
   buildAccountMetas,
@@ -72,7 +72,7 @@ import {
   ACCOUNTS_PUSH_ORACLE_PRICE,
   ACCOUNTS_SET_ORACLE_AUTHORITY,
   WELL_KNOWN,
-} from "@percolator/core";
+} from "@percolator/sdk";
 
 import {
   parseHeader,
@@ -86,7 +86,7 @@ import {
   type EngineState,
   type RiskParams,
   type Account,
-} from "@percolator/core";
+} from "@percolator/sdk";
 
 // ============================================================================
 // CONSTANTS
@@ -516,11 +516,11 @@ export class TestHarness {
       userIdx: user.accountIndex,
       size,
     });
+    // PERC-199: clock sysvar removed — program uses Clock::get() syscall
     const keys = buildAccountMetas(ACCOUNTS_TRADE_NOCPI, [
       user.keypair.publicKey,
       lp.keypair.publicKey,
       ctx.slab.publicKey,
-      WELL_KNOWN.clock,
       ctx.slab.publicKey, // oracle = slab for admin oracle
     ]);
 

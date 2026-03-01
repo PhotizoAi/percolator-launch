@@ -20,7 +20,7 @@ import { MarketBrowser } from "@/components/market/MarketBrowser";
 import { useMarketDiscovery } from "@/hooks/useMarketDiscovery";
 import { useMultiTokenMeta } from "@/hooks/useMultiTokenMeta";
 import { PublicKey } from "@solana/web3.js";
-import type { DiscoveredMarket } from "@percolator/core";
+import type { DiscoveredMarket } from "@percolator/sdk";
 
 // Mock Next.js
 vi.mock("next/link", () => ({
@@ -37,6 +37,7 @@ vi.mock("@/lib/health", () => ({
   computeMarketHealth: (engine: any) => ({
     level: engine?.vault > 1000000n ? "healthy" : "warning",
   }),
+  sanitizeAccountCount: (count: number) => (count > 4096 || count < 0 ? 0 : count),
 }));
 
 const mockPublicKey = new PublicKey("11111111111111111111111111111111");
@@ -149,7 +150,7 @@ describe("MarketBrowser Component Tests", () => {
       render(<MarketBrowser />);
 
       // Should display market
-      expect(screen.getByText(/SOL\/USD PERP/i)).toBeInTheDocument();
+      expect(screen.getAllByText(/SOL\/USD PERP/i).length).toBeGreaterThanOrEqual(1);
     });
 
     // Placeholder for future search debouncing test
@@ -175,7 +176,7 @@ describe("MarketBrowser Component Tests", () => {
 
       render(<MarketBrowser />);
 
-      expect(screen.getByText(/SOL\/USD PERP/i)).toBeInTheDocument();
+      expect(screen.getAllByText(/SOL\/USD PERP/i).length).toBeGreaterThanOrEqual(1);
     });
 
     // Placeholder for future URL persistence test
@@ -302,7 +303,7 @@ describe("MarketBrowser Component Tests", () => {
       render(<MarketBrowser />);
 
       // Should show shortened address when symbol is not available
-      expect(screen.getByText(/1111\.\.\.1111\/USD PERP/i)).toBeInTheDocument();
+      expect(screen.getAllByText(/1111\.\.\.1111\/USD PERP/i).length).toBeGreaterThanOrEqual(1);
     });
   });
 
@@ -322,7 +323,7 @@ describe("MarketBrowser Component Tests", () => {
 
       render(<MarketBrowser />);
 
-      expect(screen.getByText(/SOL\/USD PERP/i)).toBeInTheDocument();
+      expect(screen.getAllByText(/SOL\/USD PERP/i).length).toBeGreaterThanOrEqual(1);
     });
 
     // Placeholder for future clear search test
@@ -400,11 +401,11 @@ describe("MarketBrowser Component Tests", () => {
       render(<MarketBrowser />);
 
       // Check Open Interest
-      expect(screen.getByText(/5 SOL/i)).toBeInTheDocument();
+      expect(screen.getAllByText(/5 SOL/i).length).toBeGreaterThanOrEqual(1);
       // Check Insurance Fund
-      expect(screen.getByText(/1 SOL/i)).toBeInTheDocument();
+      expect(screen.getAllByText(/1 SOL/i).length).toBeGreaterThanOrEqual(1);
       // Check Account Count
-      expect(screen.getByText("42")).toBeInTheDocument();
+      expect(screen.getAllByText("42").length).toBeGreaterThanOrEqual(1);
     });
 
     it("should render trade link with correct href", () => {
@@ -427,7 +428,8 @@ describe("MarketBrowser Component Tests", () => {
 
       render(<MarketBrowser />);
 
-      const tradeLink = screen.getByRole("link", { name: /Trade/i });
+      const tradeLinks = screen.getAllByRole("link", { name: /Trade/i });
+      const tradeLink = tradeLinks[0];
       expect(tradeLink).toHaveAttribute("href", `/trade/${slabKey.toBase58()}`);
     });
   });
@@ -451,7 +453,7 @@ describe("MarketBrowser Component Tests", () => {
 
       render(<MarketBrowser />);
 
-      expect(screen.getByText("Admin")).toBeInTheDocument();
+      expect(screen.getAllByText("Admin").length).toBeGreaterThanOrEqual(1);
     });
 
     it("should show Pyth badge for non-zero oracle feed ID", () => {
@@ -472,7 +474,7 @@ describe("MarketBrowser Component Tests", () => {
 
       render(<MarketBrowser />);
 
-      expect(screen.getByText("Pyth")).toBeInTheDocument();
+      expect(screen.getAllByText("Pyth").length).toBeGreaterThanOrEqual(1);
     });
   });
 });

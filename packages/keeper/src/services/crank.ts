@@ -2,13 +2,15 @@ import { PublicKey, SYSVAR_CLOCK_PUBKEY } from "@solana/web3.js";
 import {
   discoverMarkets,
   encodeKeeperCrank,
+  encodePushOraclePrice,
   buildAccountMetas,
   buildIx,
   derivePythPushOraclePDA,
   ACCOUNTS_KEEPER_CRANK,
+  ACCOUNTS_PUSH_ORACLE_PRICE,
   type DiscoveredMarket,
-} from "@percolator/core";
-import { config, getConnection, getFallbackConnection, loadKeypair, sendWithRetry, rateLimitedCall, eventBus, createLogger, sendCriticalAlert } from "@percolator/shared";
+} from "@percolator/sdk";
+import { config, getConnection, getFallbackConnection, loadKeypair, sendWithRetry, sendWithRetryKeeper, rateLimitedCall, eventBus, createLogger, sendCriticalAlert } from "@percolator/shared";
 import { OracleService } from "./oracle.js";
 
 const logger = createLogger("keeper:crank");
@@ -23,6 +25,8 @@ interface MarketCrankState {
   isActive: boolean;
   /** Number of consecutive discoveries where this market was missing */
   missingDiscoveryCount: number;
+  /** Permanently skip — market is not initialized on-chain (error 0x4) */
+  permanentlySkipped?: boolean;
 }
 
 /** Process items in batches with delay between batches.
@@ -128,6 +132,12 @@ export class CrankService {
         const state = this.markets.get(key)!;
         state.market = market;
         state.missingDiscoveryCount = 0;
+        // Re-enable permanently skipped markets on rediscovery (may have been initialized since)
+        if (state.permanentlySkipped) {
+          state.permanentlySkipped = false;
+          state.consecutiveFailures = 0;
+          logger.info("Re-enabling previously skipped market", { slabAddress: key });
+        }
       }
     }
 
@@ -165,20 +175,37 @@ export class CrankService {
     const { market } = state;
 
     try {
-      if (this.isAdminOracle(market)) {
+      const connection = getConnection();
+      const keypair = loadKeypair(process.env.CRANK_KEYPAIR!);
+      const programId = market.programId;
+
+      // PERC-204: Build all instructions into a single transaction bundle
+      const instructions = [];
+
+      // PERC-204: Bundle oracle price push with crank tx (eliminates separate oracle tx round-trip)
+      // Only push if we are the oracle authority for this market
+      if (this.isAdminOracle(market) && keypair.publicKey.equals(market.config.oracleAuthority)) {
         try {
-          await this.oracleService.pushPrice(slabAddress, market.config, market.programId);
+          const mint = market.config.collateralMint.toBase58();
+          const priceEntry = await this.oracleService.fetchPrice(mint, slabAddress);
+          if (priceEntry) {
+            const pushData = encodePushOraclePrice({
+              priceE6: priceEntry.priceE6,
+              timestamp: BigInt(Math.floor(Date.now() / 1000)),
+            });
+            const pushKeys = buildAccountMetas(ACCOUNTS_PUSH_ORACLE_PRICE, [
+              keypair.publicKey, market.slabAddress,
+            ]);
+            instructions.push(buildIx({ programId, keys: pushKeys, data: pushData }));
+          }
         } catch (priceErr) {
-          // Non-fatal: oracle authority may be the market admin, not the crank.
-          logger.warn("Price push skipped", { slabAddress, error: priceErr instanceof Error ? priceErr.message : String(priceErr) });
+          // Non-fatal: price fetch failed, crank will still run with existing on-chain price
+          logger.warn("Price push skipped (bundled)", { slabAddress, error: priceErr instanceof Error ? priceErr.message : String(priceErr) });
         }
       }
 
-      const connection = getConnection();
-      const keypair = loadKeypair(config.crankKeypair);
-      const programId = market.programId;
-
-      const data = encodeKeeperCrank({ callerIdx: 65535, allowPanic: false });
+      // Crank instruction
+      const crankData = encodeKeeperCrank({ callerIdx: 65535, allowPanic: false });
 
       let oracleKey: PublicKey;
       if (this.isAdminOracle(market)) {
@@ -189,15 +216,16 @@ export class CrankService {
         oracleKey = derivePythPushOraclePDA(feedHex)[0];
       }
 
-      const keys = buildAccountMetas(ACCOUNTS_KEEPER_CRANK, [
+      const crankKeys = buildAccountMetas(ACCOUNTS_KEEPER_CRANK, [
         keypair.publicKey,
         market.slabAddress,
         SYSVAR_CLOCK_PUBKEY,
         oracleKey,
       ]);
+      instructions.push(buildIx({ programId, keys: crankKeys, data: crankData }));
 
-      const ix = buildIx({ programId, keys, data });
-      const sig = await sendWithRetry(connection, ix, [keypair]);
+      // PERC-204: Use keeper-optimized send (skipPreflight + multi-RPC + tight CU)
+      const sig = await sendWithRetryKeeper(connection, instructions, [keypair]);
 
       // BC1: Track signature to prevent replay attacks
       const now = Date.now();
@@ -220,6 +248,19 @@ export class CrankService {
     } catch (err) {
       state.failureCount++;
       state.consecutiveFailures++;
+
+      // Detect NotInitialized (error 0x4) — permanently skip these markets
+      const errMsg = err instanceof Error ? err.message : String(err);
+      if (errMsg.includes("custom program error: 0x4")) {
+        state.permanentlySkipped = true;
+        state.isActive = false;
+        logger.warn("Market not initialized on-chain, permanently skipping", {
+          slabAddress,
+          programId: market.programId.toBase58(),
+        });
+        return false;
+      }
+
       // Mark inactive after 10 consecutive failures regardless of lifetime success
       if (state.consecutiveFailures >= 10) {
         state.isActive = false;
@@ -261,6 +302,10 @@ export class CrankService {
 
     // H5: Crank all discovered markets, not just admin-oracle ones
     for (const [slabAddress, state] of this.markets) {
+      if (state.permanentlySkipped) {
+        skipped++;
+        continue;
+      }
       if (state.consecutiveFailures > MAX_CONSECUTIVE_FAILURES) {
         skipped++;
         continue;
@@ -278,9 +323,14 @@ export class CrankService {
       logger.warn("Crank mismatch", { totalMarkets: this.markets.size, toCrank: toCrank.length, skipped });
     }
 
-    // Process in batches of 3 with 2s gaps between batches
-    // BM7: Collect per-market error tracking
-    const batchResult = await processBatched(toCrank, 3, 2_000, async (slabAddress) => {
+    // PERC-204: Full parallel fan-out — all market cranks are independent transactions,
+    // submit them all simultaneously instead of in sequential batches.
+    // Each market gets its own transaction with independent nonce/blockhash.
+    // The Solana network de-dupes by signature, so parallel submission is safe.
+    const PARALLEL_CONCURRENCY = 10; // Cap concurrency to avoid rate limit storms
+
+    // Process in parallel batches (larger batches, no delay between)
+    const batchResult = await processBatched(toCrank, PARALLEL_CONCURRENCY, 500, async (slabAddress) => {
       const ok = await this.crankMarket(slabAddress);
       if (ok) success++;
       else failed++;
@@ -288,9 +338,10 @@ export class CrankService {
 
     // BM7: Log detailed error summary if any failed
     if (batchResult.failed > 0) {
-      logger.error("Batch completed with errors", { 
+      logger.error("Parallel crank batch completed with errors", { 
         failedCount: batchResult.failed,
-        successCount: success
+        successCount: success,
+        parallelism: PARALLEL_CONCURRENCY,
       });
       for (const [slab, error] of batchResult.errors) {
         logger.error("Batch error detail", { slabAddress: slab, error: error.message });

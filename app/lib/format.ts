@@ -1,11 +1,21 @@
-export function formatTokenAmount(raw: bigint | null | undefined, decimals: number = 6): string {
+export function formatTokenAmount(
+  raw: bigint | null | undefined,
+  decimals: number = 6,
+  maxDisplayDecimals?: number,
+): string {
   if (raw == null) return "0";
   const negative = raw < 0n;
   const abs = negative ? -raw : raw;
   const divisor = 10n ** BigInt(decimals);
   const whole = abs / divisor;
   const frac = abs % divisor;
-  const fracStr = frac.toString().padStart(decimals, "0").replace(/0+$/, "");
+  let fracStr = frac.toString().padStart(decimals, "0").replace(/0+$/, "");
+
+  // Optionally truncate to maxDisplayDecimals (rounds down)
+  if (maxDisplayDecimals != null && fracStr.length > maxDisplayDecimals) {
+    fracStr = fracStr.slice(0, maxDisplayDecimals).replace(/0+$/, "");
+  }
+
   const formatted = fracStr ? `${whole.toString()}.${fracStr}` : whole.toString();
   return negative ? `-${formatted}` : formatted;
 }
@@ -28,6 +38,11 @@ export const LIQ_PRICE_UNLIQUIDATABLE = 18446744073709551615n; // max u64
 
 export function formatUsd(priceE6: bigint | null | undefined): string {
   if (priceE6 == null) return "$0.00";
+  // Defense-in-depth: reject absurd values (matches Rust MAX_ORACLE_PRICE = 1e15)
+  if (priceE6 > 1_000_000_000_000_000n) return "$—";
+  if (priceE6 < 0n) return "$—";
+  // PERC-297: 0 price means oracle data unavailable — show dash instead of "$0.00"
+  if (priceE6 === 0n) return "$—";
   const val = Number(priceE6) / 1_000_000;
   return `$${val.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 6 })}`;
 }

@@ -29,6 +29,7 @@ import { computeMarketHealth } from "@/lib/health";
 import { useLivePrice } from "@/hooks/useLivePrice";
 import { useTokenMeta } from "@/hooks/useTokenMeta";
 import { useToast } from "@/hooks/useToast";
+import { isPlaceholderSymbol } from "@/lib/symbol-utils";
 
 /* ── Reusable tiny components ─────────────────────────────── */
 
@@ -140,18 +141,46 @@ function TradePageInner({ slab }: { slab: string }) {
   const { priceUsd } = useLivePrice();
   const health = engine ? computeMarketHealth(engine) : null;
   const pageRef = useRef<HTMLDivElement>(null);
-  const symbol = tokenMeta?.symbol ?? (config?.collateralMint ? `${config.collateralMint.toBase58().slice(0, 4)}…${config.collateralMint.toBase58().slice(-4)}` : "TOKEN");
   const shortAddress = `${slab.slice(0, 4)}…${slab.slice(-4)}`;
 
-  // Fetch logo URL
-  const [logoUrl, setLogoUrl] = useState<string | null>(null);
+  // Fetch Supabase market data (symbol, name, logo) as fallback for on-chain resolution
+  const [supabaseMarket, setSupabaseMarket] = useState<{ symbol?: string; name?: string; logo_url?: string } | null>(null);
   useEffect(() => {
     let cancelled = false;
-    fetch(`/api/markets/${slab}/logo`).then(r => r.json()).then(d => {
-      if (!cancelled && d.logo_url) setLogoUrl(d.logo_url);
-    }).catch(() => {});
+    fetch(`/api/markets/${slab}`)
+      .then(r => r.json())
+      .then(d => {
+        if (!cancelled && d.market) {
+          setSupabaseMarket({
+            symbol: d.market.symbol ?? undefined,
+            name: d.market.name ?? undefined,
+            logo_url: d.market.logo_url ?? undefined,
+          });
+        }
+      })
+      .catch(() => {});
     return () => { cancelled = true; };
   }, [slab]);
+
+  // Resolve symbol: on-chain (useTokenMeta) → Supabase → truncated address
+  const mintAddress = config?.collateralMint?.toBase58() ?? "";
+  const onChainSymbol = tokenMeta?.symbol ?? null;
+  const supabaseSymbol = supabaseMarket?.symbol ?? null;
+  const symbol = (() => {
+    // 1. On-chain symbol (if it's a real name, not a truncated address)
+    if (!isPlaceholderSymbol(onChainSymbol, mintAddress)) return onChainSymbol!;
+    // 2. Supabase symbol (if it's a real name, not a placeholder)
+    if (!isPlaceholderSymbol(supabaseSymbol, mintAddress)) return supabaseSymbol!;
+    // 3. Fallback: truncated mint address
+    if (config?.collateralMint) {
+      const b58 = config.collateralMint.toBase58();
+      return `${b58.slice(0, 4)}…${b58.slice(-4)}`;
+    }
+    return "TOKEN";
+  })();
+
+  // Logo URL from Supabase market data
+  const logoUrl = supabaseMarket?.logo_url ?? null;
 
   // Dynamic page title and meta tags
   useEffect(() => {
@@ -180,14 +209,18 @@ function TradePageInner({ slab }: { slab: string }) {
     ? `$${priceUsd < 0.01 ? priceUsd.toFixed(6) : priceUsd < 1 ? priceUsd.toFixed(4) : priceUsd.toFixed(2)}`
     : null;
 
+  // Track whether the fade-in animation has already been applied
+  const animatedRef = useRef(false);
+
   useEffect(() => {
-    if (!pageRef.current) return;
+    if (!pageRef.current || animatedRef.current) return;
+    animatedRef.current = true;
     if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
       pageRef.current.style.opacity = "1";
       return;
     }
     gsap.fromTo(pageRef.current, { opacity: 0 }, { opacity: 1, duration: 0.3, ease: "power2.out" });
-  }, []);
+  }); // No deps — runs every render until pageRef is available
 
   // Loading state — show while slab data is being fetched
   if (slabLoading && !engine) {
@@ -227,17 +260,17 @@ function TradePageInner({ slab }: { slab: string }) {
         <div className="flex items-center justify-between">
           <div className="min-w-0">
             <div className="flex items-center gap-2">
-              <MarketLogo logoUrl={logoUrl} symbol={symbol} size="sm" />
+              <MarketLogo logoUrl={logoUrl} mintAddress={config?.collateralMint?.toBase58()} symbol={symbol} size="sm" />
               <h1 className="text-sm font-bold text-[var(--text)]" style={{ fontFamily: "var(--font-display)" }}>
                 {symbol}/USD <span className="text-[10px] font-normal uppercase tracking-[0.15em] text-[var(--text-muted)]">PERP</span>
               </h1>
             </div>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-1.5 min-w-0 overflow-hidden">
             <UsdToggleButton />
             {health && <HealthBadge level={health.level} />}
             {priceDisplay && (
-              <span className="text-sm font-bold text-[var(--text)]" style={{ fontFamily: "var(--font-mono)" }}>{priceDisplay}</span>
+              <span className="shrink-0 text-sm font-bold text-[var(--text)]" style={{ fontFamily: "var(--font-mono)" }}>{priceDisplay}</span>
             )}
           </div>
         </div>
@@ -266,7 +299,7 @@ function TradePageInner({ slab }: { slab: string }) {
       {/* ── DESKTOP: Compact header bar ── */}
       <div className="hidden lg:flex items-center gap-3 border-b border-[var(--border)]/30 px-6 py-1.5">
         {/* Left: pair selector */}
-        <MarketLogo logoUrl={logoUrl} symbol={symbol} size="sm" />
+        <MarketLogo logoUrl={logoUrl} mintAddress={config?.collateralMint?.toBase58()} symbol={symbol} size="sm" />
         <MarketSelector
           currentSlabAddress={slab}
           symbol={symbol}

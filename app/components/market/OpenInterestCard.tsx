@@ -2,6 +2,8 @@
 
 import { FC, useState, useEffect, useMemo } from "react";
 import { useEngineState } from "@/hooks/useEngineState";
+import { useSlabState } from "@/components/providers/SlabProvider";
+import { useTokenMeta } from "@/hooks/useTokenMeta";
 import { InfoIcon } from "@/components/ui/Tooltip";
 import { isMockMode } from "@/lib/mock-mode";
 import { isMockSlab } from "@/lib/mock-trade-data";
@@ -32,18 +34,18 @@ const MOCK_OI: OpenInterestData = {
   ],
 };
 
-function formatUsdAmount(amountE6: string | bigint): string {
-  const num = typeof amountE6 === "string" ? BigInt(amountE6) : amountE6;
-  const usd = Number(num) / 1e6;
+function formatUsdAmount(amountRaw: string | bigint, decimals: number = 6): string {
+  const num = typeof amountRaw === "string" ? BigInt(amountRaw) : amountRaw;
+  const usd = Number(num) / (10 ** decimals);
   return usd.toLocaleString(undefined, {
     minimumFractionDigits: 0,
     maximumFractionDigits: 0,
   });
 }
 
-function formatSignedUsdAmount(amountE6: string): string {
-  const num = BigInt(amountE6 ?? "0");
-  const usd = Number(num) / 1e6;
+function formatSignedUsdAmount(amountRaw: string, decimals: number = 6): string {
+  const num = BigInt(amountRaw ?? "0");
+  const usd = Number(num) / (10 ** decimals);
   const formatted = Math.abs(usd).toLocaleString(undefined, {
     minimumFractionDigits: 0,
     maximumFractionDigits: 0,
@@ -56,6 +58,9 @@ export const OpenInterestCard: FC<{ slabAddress: string }> = ({
 }) => {
   const mockMode = isMockMode() && isMockSlab(slabAddress);
   const { engine } = useEngineState();
+  const { config } = useSlabState();
+  const tokenMeta = useTokenMeta(config?.collateralMint ?? null);
+  const tokenDecimals = tokenMeta?.decimals ?? 6;
 
   const [oiData, setOiData] = useState<OpenInterestData | null>(
     mockMode ? MOCK_OI : null
@@ -103,8 +108,8 @@ export const OpenInterestCard: FC<{ slabAddress: string }> = ({
     return () => clearInterval(interval);
   }, [slabAddress, mockMode, engine]);
 
-  // Calculate percentages and imbalance
-  const { longPct, shortPct, imbalancePct, imbalanceLabel, imbalanceColor } =
+  // Calculate percentages, imbalance, and OI utilization
+  const { longPct, shortPct, imbalancePct, imbalanceLabel, imbalanceColor, oiUtilPct, oiUtilColor } =
     useMemo(() => {
       if (!oiData) {
         return {
@@ -113,6 +118,8 @@ export const OpenInterestCard: FC<{ slabAddress: string }> = ({
           imbalancePct: 0,
           imbalanceLabel: "Balanced",
           imbalanceColor: "text-[var(--text-muted)]",
+          oiUtilPct: 0,
+          oiUtilColor: "var(--accent)",
         };
       }
 
@@ -123,6 +130,16 @@ export const OpenInterestCard: FC<{ slabAddress: string }> = ({
       const longPercent = totalNum > 0 ? (longNum / totalNum) * 100 : 50;
       const shortPercent = totalNum > 0 ? (shortNum / totalNum) * 100 : 50;
       const imbalance = longPercent - shortPercent;
+
+      // OI Utilization: ratio of total OI to max capacity
+      // Use maxOpenInterest from market data if available, otherwise default to $5M
+      const maxOi = 5_000_000 * 1e6; // $5M in e6 units — placeholder until market.maxOpenInterest is available
+      const utilization = maxOi > 0 ? Math.min(totalNum / maxOi, 1) : 0;
+      // Dynamic color based on utilization level
+      const utilColor =
+        utilization < 0.5 ? "var(--accent)" :     // purple — normal
+        utilization < 0.8 ? "var(--warning)" :     // yellow — elevated
+        "var(--short)";                             // red — near capacity
 
       let label = "Balanced";
       let color = "text-[var(--text-muted)]";
@@ -154,6 +171,8 @@ export const OpenInterestCard: FC<{ slabAddress: string }> = ({
         imbalancePct: imbalance,
         imbalanceLabel: label,
         imbalanceColor: color,
+        oiUtilPct: utilization * 100,
+        oiUtilColor: utilColor,
       };
     }, [oiData]);
 
@@ -183,10 +202,10 @@ export const OpenInterestCard: FC<{ slabAddress: string }> = ({
     );
   }
 
-  const totalOiUsd = formatUsdAmount(oiData.totalOi);
-  const longOiUsd = formatUsdAmount(oiData.longOi);
-  const shortOiUsd = formatUsdAmount(oiData.shortOi);
-  const lpNetUsd = formatSignedUsdAmount(oiData.netLpPosition);
+  const totalOiUsd = formatUsdAmount(oiData.totalOi, tokenDecimals);
+  const longOiUsd = formatUsdAmount(oiData.longOi, tokenDecimals);
+  const shortOiUsd = formatUsdAmount(oiData.shortOi, tokenDecimals);
+  const lpNetUsd = formatSignedUsdAmount(oiData.netLpPosition, tokenDecimals);
   const lpDirection = BigInt(oiData.netLpPosition ?? "0") >= 0n ? "long" : "short";
 
   return (
@@ -205,6 +224,27 @@ export const OpenInterestCard: FC<{ slabAddress: string }> = ({
         >
           ${totalOiUsd}
         </span>
+      </div>
+
+      {/* OI Utilization bar with label */}
+      <div className="mb-1.5">
+        <div className="mb-1 flex items-center justify-between">
+          <span className="text-[9px] uppercase tracking-[0.04em] text-[var(--text-dim)]">
+            OI Utilization
+          </span>
+          <span
+            className="text-[9px] font-medium"
+            style={{ fontFamily: "var(--font-mono)", color: oiUtilColor, fontVariantNumeric: "tabular-nums" }}
+          >
+            {Math.round(oiUtilPct)}%
+          </span>
+        </div>
+        <div className="h-1.5 w-full overflow-hidden rounded-sm bg-[var(--border)]/30">
+          <div
+            className="h-full transition-all duration-500 ease-out rounded-sm"
+            style={{ width: `${oiUtilPct}%`, backgroundColor: oiUtilColor }}
+          />
+        </div>
       </div>
 
       {/* Long/Short bars — compact inline */}

@@ -4,8 +4,8 @@
  * use this data instead of fetching from chain.
  */
 import { PublicKey } from "@solana/web3.js";
-import type { MarketConfig, EngineState, RiskParams, SlabHeader, Account } from "@percolator/core";
-import { AccountKind } from "@percolator/core";
+import type { MarketConfig, EngineState, RiskParams, SlabHeader, Account } from "@percolator/sdk";
+import { AccountKind } from "@percolator/sdk";
 
 interface MockMarketData {
   symbol: string;
@@ -83,6 +83,10 @@ export function getMockSlabState(address: string) {
     authorityTimestamp: BigInt(Math.floor(Date.now() / 1000)),
     oraclePriceCapE2bps: 500n,
     lastEffectivePriceE6: priceE6,
+    oiCapMultiplierBps: 0n,
+    maxPnlCap: 0n,
+    marketCreatedSlot: 0n,
+    oiRampSlots: 0n,
   } as MarketConfig;
 
   const engine: EngineState = {

@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { IX_TAG } from "@percolator/core";
+import { IX_TAG } from "@percolator/sdk";
 import { config, insertTrade, eventBus, decodeBase58, readU128LE, parseTradeSize, createLogger } from "@percolator/shared";
 
 const logger = createLogger("indexer:webhook");
@@ -112,8 +112,9 @@ function extractTradesFromEnhancedTx(tx: any): TradeData[] {
     const { sizeValue, side } = parseTradeSize(data.slice(5, 21));
 
     // Account layout (from core/abi/accounts.ts):
-    // TradeNoCpi: [0]=user(signer), [1]=lp(signer), [2]=slab(writable), [3]=clock, [4]=oracle
-    // TradeCpi:   [0]=user(signer), [1]=lpOwner,    [2]=slab(writable), [3]=clock, [4]=oracle, ...
+    // PERC-199: clock sysvar removed from trade instructions
+    // TradeNoCpi: [0]=user(signer), [1]=lp(signer), [2]=slab(writable), [3]=oracle
+    // TradeCpi:   [0]=user(signer), [1]=lpOwner,    [2]=slab(writable), [3]=oracle, ...
     const accounts: string[] = ix.accounts ?? [];
     const trader = accounts[0] ?? "";
     const slabAddress = accounts.length > 2 ? accounts[2] : "";

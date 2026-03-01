@@ -7,9 +7,12 @@ import { useSlabState } from "@/components/providers/SlabProvider";
 import { useUsdToggle } from "@/components/providers/UsdToggleProvider";
 import { useTokenMeta } from "@/hooks/useTokenMeta";
 import { formatTokenAmount, formatUsd, formatBps } from "@/lib/format";
+import { sanitizeOnChainValue, sanitizeAccountCount } from "@/lib/health";
 import { useLivePrice } from "@/hooks/useLivePrice";
+import { resolveMarketPriceE6 } from "@/lib/oraclePrice";
 import { FundingRateCard } from "./FundingRateCard";
 import { FundingRateChart } from "./FundingRateChart";
+import { sanitizeSymbol } from "@/lib/symbol-utils";
 
 function formatNum(n: number): string {
   if (n >= 1_000_000) return `$${(n / 1_000_000).toFixed(1)}M`;
@@ -24,7 +27,8 @@ export const MarketStatsCard: FC = () => {
   const { priceE6: livePriceE6, priceUsd } = useLivePrice();
   const { showUsd } = useUsdToggle();
   const tokenMeta = useTokenMeta(mktConfig?.collateralMint ?? null);
-  const symbol = tokenMeta?.symbol ?? "Token";
+  const mintAddress = mktConfig?.collateralMint?.toBase58() ?? "";
+  const symbol = sanitizeSymbol(tokenMeta?.symbol, mintAddress);
   const [showFundingChart, setShowFundingChart] = useState(false);
 
   if (loading || !engine || !config || !params) {
@@ -35,22 +39,25 @@ export const MarketStatsCard: FC = () => {
     );
   }
 
-  const totalOI = engine.totalOpenInterest ?? 0n;
-  const vault = engine.vault ?? 0n;
+  const decimals = tokenMeta?.decimals ?? 6;
+  const tokenDivisor = 10 ** decimals;
+  // Sanitize sentinel values (u64::MAX) from uninitialized on-chain fields
+  const totalOI = sanitizeOnChainValue(engine.totalOpenInterest ?? 0n);
+  const vault = sanitizeOnChainValue(engine.vault ?? 0n);
   const oiDisplay = showUsd && priceUsd != null
-    ? formatNum((Number(totalOI) / 1e6) * priceUsd)
-    : formatTokenAmount(totalOI);
+    ? formatNum((Number(totalOI) / tokenDivisor) * priceUsd)
+    : formatTokenAmount(totalOI, decimals);
   const vaultDisplay = showUsd && priceUsd != null
-    ? formatNum((Number(vault) / 1e6) * priceUsd)
-    : formatTokenAmount(vault);
+    ? formatNum((Number(vault) / tokenDivisor) * priceUsd)
+    : formatTokenAmount(vault, decimals);
 
   const stats = [
-    { label: `${symbol} Price`, value: formatUsd(livePriceE6 ?? config.lastEffectivePriceE6) },
+    { label: `${symbol} Price`, value: formatUsd(livePriceE6 ?? (mktConfig ? resolveMarketPriceE6(mktConfig) : 0n)) },
     { label: "Open Interest", value: oiDisplay },
     { label: "Vault", value: vaultDisplay },
     { label: "Trading Fee", value: formatBps(params.tradingFeeBps) },
     { label: "Init. Margin", value: formatBps(params.initialMarginBps) },
-    { label: "Accounts", value: (engine.numUsedAccounts ?? 0).toString() },
+    { label: "Accounts", value: sanitizeAccountCount(engine.numUsedAccounts ?? 0, params ? Number(params.maxAccounts) : undefined).toString() },
   ];
 
   return (
@@ -60,7 +67,7 @@ export const MarketStatsCard: FC = () => {
         <div className="grid grid-cols-3 gap-px">
           {stats.map((s) => (
             <div key={s.label} className="px-1.5 py-1 border-b border-r border-[var(--border)]/20 last:border-r-0 [&:nth-child(3n)]:border-r-0 [&:nth-last-child(-n+3)]:border-b-0">
-              <p className="text-[8px] uppercase tracking-[0.1em] text-[var(--text-dim)] truncate">{s.label}</p>
+              <p className="text-[8px] uppercase tracking-[0.1em] text-[var(--text-muted)] truncate">{s.label}</p>
               <p className="text-[11px] font-medium text-[var(--text)] truncate" style={{ fontFamily: "var(--font-mono)" }}>{s.value}</p>
             </div>
           ))}

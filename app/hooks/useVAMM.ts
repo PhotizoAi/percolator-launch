@@ -14,8 +14,7 @@ import {
 } from "@solana/spl-token";
 import {
   encodeInitLP,
-  encodeInitVamm,
-  encodeTradeCpi,
+  encodeTradeCpiV2,
   encodeKeeperCrank,
   ACCOUNTS_INIT_LP,
   ACCOUNTS_TRADE_CPI,
@@ -27,7 +26,7 @@ import {
   derivePythPushOraclePDA,
   WELL_KNOWN,
   AccountKind,
-} from "@percolator/core";
+} from "@percolator/sdk";
 import { sendTx } from "@/lib/tx";
 import { useSlabState } from "@/components/providers/SlabProvider";
 
@@ -142,28 +141,12 @@ export function useVAMM(slabAddress: string) {
           programId: matcherProgramId,
         });
 
-        // 2. Initialize vAMM matcher
-        const initVammData = encodeInitVamm({
-          mode: cfg.mode,
-          tradingFeeBps: cfg.tradingFeeBps,
-          baseSpreadBps: cfg.baseSpreadBps,
-          maxTotalBps: cfg.maxTotalBps,
-          impactKBps: cfg.impactKBps,
-          liquidityNotionalE6: cfg.liquidityNotionalE6,
-          maxFillAbs: cfg.maxFillAbs,
-          maxInventoryAbs: cfg.maxInventoryAbs,
-        });
-
-        const initMatcherIx = new TransactionInstruction({
-          programId: matcherProgramId,
-          keys: [
-            { pubkey: lpPda, isSigner: false, isWritable: false },
-            { pubkey: matcherCtxKp.publicKey, isSigner: false, isWritable: true },
-          ],
-          data: Buffer.from(initVammData),
-        });
-
-        // 3. InitLP on percolator
+        // 2. InitLP on percolator
+        // NOTE: The new reference AMM matcher (GTRgy...) does NOT have an
+        // InitVamm (Tag 2) instruction. It only has Tag 0 (CPI matcher call).
+        // The AMM reads LP config from context bytes 64..68 (spread_bps u16 +
+        // max_fill_pct u16), using defaults (30 bps spread, 100% fill) when
+        // zeroed. No separate initialization instruction is needed.
         const initLpData = encodeInitLP({
           matcherProgram: matcherProgramId,
           matcherContext: matcherCtxKp.publicKey,
@@ -182,7 +165,7 @@ export function useVAMM(slabAddress: string) {
           data: initLpData,
         });
 
-        instructions.push(createCtxIx, initMatcherIx, initLpIx);
+        instructions.push(createCtxIx, initLpIx);
 
         const sig = await sendTx({
           connection,
@@ -249,23 +232,25 @@ export function useVAMM(slabAddress: string) {
         });
         instructions.push(crankIx);
 
-        // TradeCpi instruction
+        // TradeCpiV2 — uses caller-provided PDA bump to save ~1500 CU (PERC-154)
+        // PERC-199: clock sysvar removed — uses Clock::get() syscall
+        const [, lpBump] = deriveLpPda(programId, slabPk, params.lpIdx);
         const tradeIx = buildIx({
           programId,
           keys: buildAccountMetas(ACCOUNTS_TRADE_CPI, [
             wallet.publicKey,
             lpAccount.account.owner,
             slabPk,
-            WELL_KNOWN.clock,
             oracleAccount,
             lpAccount.account.matcherProgram,
             lpAccount.account.matcherContext,
             lpPda,
           ]),
-          data: encodeTradeCpi({
+          data: encodeTradeCpiV2({
             lpIdx: params.lpIdx,
             userIdx: params.userIdx,
             size: params.size.toString(),
+            bump: lpBump,
           }),
         });
         instructions.push(tradeIx);

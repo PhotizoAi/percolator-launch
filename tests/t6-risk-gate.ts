@@ -51,13 +51,13 @@ import {
   parseParams,
   deriveLpPda,
   fetchSlab,
-} from "@percolator/core";
+} from "@percolator/sdk";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 const RPC_URL = process.env.SOLANA_RPC_URL ?? "https://api.devnet.solana.com";
 const PROGRAM_ID = new PublicKey(process.env.PROGRAM_ID ?? "FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD");
-const MATCHER_PROGRAM_ID = new PublicKey(process.env.MATCHER_PROGRAM_ID ?? "4HcGCsyjAqnFua5ccuXyt8KRRQzKFbGTJkVChpS7Yfzy");
+const MATCHER_PROGRAM_ID = new PublicKey(process.env.MATCHER_PROGRAM_ID ?? "GTRgyTDfrMvBubALAqtHuQwT8tbGyXid7svXZKtWfC9k");
 const SLAB_SIZE = Number(process.env.SLAB_SIZE ?? 62_808);
 const MATCHER_CTX_SIZE = 320;
 
@@ -228,31 +228,9 @@ async function main() {
       programId: MATCHER_PROGRAM_ID,
     }));
 
-    // Init vAMM (Tag 2)
-    const vammData = new Uint8Array(66);
-    const dv = new DataView(vammData.buffer);
-    let off = 0;
-    vammData[off] = 2; off += 1;
-    vammData[off] = 0; off += 1;
-    dv.setUint32(off, 50, true); off += 4;
-    dv.setUint32(off, 50, true); off += 4;
-    dv.setUint32(off, 200, true); off += 4;
-    dv.setUint32(off, 0, true); off += 4;
-    dv.setBigUint64(off, 10_000_000_000_000n, true); off += 8;
-    dv.setBigUint64(off, 0n, true); off += 8;
-    dv.setBigUint64(off, 1_000_000_000_000n, true); off += 8;
-    dv.setBigUint64(off, 0n, true); off += 8;
-    dv.setBigUint64(off, 0n, true); off += 8;
-    dv.setBigUint64(off, 0n, true); off += 8;
-
-    instructions.push(new TransactionInstruction({
-      programId: MATCHER_PROGRAM_ID,
-      keys: [
-        { pubkey: lpPda, isSigner: false, isWritable: false },
-        { pubkey: matcherCtxKp.publicKey, isSigner: false, isWritable: true },
-      ],
-      data: Buffer.from(vammData),
-    }));
+    // NOTE: The new reference AMM matcher does NOT have an InitVamm (Tag 2)
+    // instruction. It reads LP config from context bytes 64..68, defaulting
+    // to 30 bps spread and 100% fill when zeroed.
 
     // Init LP
     const initLpData = encodeInitLP({
@@ -359,7 +337,7 @@ async function main() {
     });
     const tradeKeys = buildAccountMetas(ACCOUNTS_TRADE_CPI, [
       trader.publicKey, lpOwner.publicKey, slab.publicKey,
-      WELL_KNOWN.clock, slab.publicKey,
+      slab.publicKey,
       MATCHER_PROGRAM_ID, matcherCtxKp.publicKey, lpPda,
     ]);
 
@@ -398,7 +376,7 @@ async function main() {
     });
     const tradeKeys = buildAccountMetas(ACCOUNTS_TRADE_CPI, [
       trader.publicKey, lpOwner.publicKey, slab.publicKey,
-      WELL_KNOWN.clock, slab.publicKey,
+      slab.publicKey,
       MATCHER_PROGRAM_ID, matcherCtxKp.publicKey, lpPda,
     ]);
 
@@ -434,7 +412,7 @@ async function main() {
     });
     const tradeKeys = buildAccountMetas(ACCOUNTS_TRADE_CPI, [
       trader.publicKey, lpOwner.publicKey, slab.publicKey,
-      WELL_KNOWN.clock, slab.publicKey,
+      slab.publicKey,
       MATCHER_PROGRAM_ID, matcherCtxKp.publicKey, lpPda,
     ]);
 
@@ -475,7 +453,7 @@ async function main() {
     });
     const tradeKeys = buildAccountMetas(ACCOUNTS_TRADE_CPI, [
       trader.publicKey, lpOwner.publicKey, slab.publicKey,
-      WELL_KNOWN.clock, slab.publicKey,
+      slab.publicKey,
       MATCHER_PROGRAM_ID, matcherCtxKp.publicKey, lpPda,
     ]);
 
@@ -503,7 +481,7 @@ async function main() {
       const tradeData = encodeTradeCpi({ lpIdx, userIdx: traderIdx, size });
       const tradeKeys = buildAccountMetas(ACCOUNTS_TRADE_CPI, [
         trader.publicKey, lpOwner.publicKey, slab.publicKey,
-        WELL_KNOWN.clock, slab.publicKey,
+        slab.publicKey,
         MATCHER_PROGRAM_ID, matcherCtxKp.publicKey, lpPda,
       ]);
       const tx = new Transaction();

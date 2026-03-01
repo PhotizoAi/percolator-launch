@@ -5,6 +5,7 @@ import { PublicKey } from "@solana/web3.js";
 import { useWalletCompat, useConnectionCompat } from "@/hooks/useWalletCompat";
 import {
   encodeTradeCpi,
+  encodeTradeCpiV2,
   encodeKeeperCrank,
   encodePushOraclePrice,
   ACCOUNTS_TRADE_CPI,
@@ -15,7 +16,7 @@ import {
   deriveLpPda,
   derivePythPushOraclePDA,
   WELL_KNOWN,
-} from "@percolator/core";
+} from "@percolator/sdk";
 import { sendTx } from "@/lib/tx";
 import { useSlabState } from "@/components/providers/SlabProvider";
 
@@ -59,7 +60,7 @@ export function useTrade(slabAddress: string) {
 
         const programId = slabProgramId;
         const slabPk = new PublicKey(slabAddress);
-        const [lpPda] = deriveLpPda(programId, slabPk, params.lpIdx);
+        const [lpPda, lpBump] = deriveLpPda(programId, slabPk, params.lpIdx);
 
         // Determine if this is an admin-oracle market:
         // oracleAuthority != default means an admin has been set (regardless of feedId)
@@ -90,12 +91,24 @@ export function useTrade(slabAddress: string) {
           } catch { /* use existing price */ }
           if (priceE6 <= 0n) priceE6 = 1_000_000n;
 
+          // Use on-chain slot time instead of client Date.now() to avoid clock drift
+          // between client and validator causing signature verification failures
+          let oracleTimestamp: bigint;
+          try {
+            const slot = await connection.getSlot("confirmed");
+            const blockTime = await connection.getBlockTime(slot);
+            oracleTimestamp = BigInt(blockTime ?? Math.floor(Date.now() / 1000));
+          } catch {
+            // Fallback to client time if RPC fails
+            oracleTimestamp = BigInt(Math.floor(Date.now() / 1000));
+          }
+
           const pushIx = buildIx({
             programId,
             keys: buildAccountMetas(ACCOUNTS_PUSH_ORACLE_PRICE, [wallet.publicKey, slabPk]),
             data: encodePushOraclePrice({
               priceE6: priceE6,
-              timestamp: BigInt(Math.floor(Date.now() / 1000)),
+              timestamp: oracleTimestamp,
             }),
           });
           instructions.push(pushIx);
@@ -111,19 +124,19 @@ export function useTrade(slabAddress: string) {
         });
         instructions.push(crankIx);
 
+        // PERC-199: clock sysvar removed from TradeCpi — program uses Clock::get() syscall
         const tradeIx = buildIx({
           programId,
           keys: buildAccountMetas(ACCOUNTS_TRADE_CPI, [
             wallet.publicKey,
             lpAccount.account.owner,
             slabPk,
-            WELL_KNOWN.clock,
             oracleAccount,
             lpAccount.account.matcherProgram,
             lpAccount.account.matcherContext,
             lpPda,
           ]),
-          data: encodeTradeCpi({ lpIdx: params.lpIdx, userIdx: params.userIdx, size: params.size.toString() }),
+          data: encodeTradeCpiV2({ lpIdx: params.lpIdx, userIdx: params.userIdx, size: params.size.toString(), bump: lpBump }),
         });
         instructions.push(tradeIx);
 

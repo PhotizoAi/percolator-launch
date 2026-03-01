@@ -4,7 +4,7 @@
  */
 export type Network = "mainnet" | "devnet";
 
-function getNetwork(): Network {
+export function getNetwork(): Network {
   if (typeof window !== "undefined") {
     try {
       const override = localStorage.getItem("percolator-network") as Network | null;
@@ -19,16 +19,37 @@ function getNetwork(): Network {
   return "devnet";
 }
 
+/** Solana public fallback RPC (rate-limited, for development/build only) */
+const PUBLIC_DEVNET_RPC = "https://api.devnet.solana.com";
+
+/**
+ * Validate an RPC URL is non-empty and has a valid scheme.
+ * Returns the URL if valid, or null if invalid/empty.
+ */
+function validateRpcUrl(url: string | undefined | null): string | null {
+  if (!url) return null;
+  const trimmed = url.trim();
+  if (!trimmed) return null;
+  // Must be http(s) — catch misconfigured values like "null", "undefined", empty-ish strings
+  if (!trimmed.startsWith("http://") && !trimmed.startsWith("https://")) {
+    console.warn(`[getRpcEndpoint] Invalid RPC URL (bad scheme): "${trimmed}"`);
+    return null;
+  }
+  return trimmed;
+}
+
 /** Get RPC endpoint — absolute /api/rpc on client, direct RPC on server */
 export function getRpcEndpoint(): string {
   if (typeof window !== "undefined") {
     return new URL("/api/rpc", window.location.origin).toString();
   }
 
-  const explicit = process.env.NEXT_PUBLIC_HELIUS_RPC_URL?.trim();
+  // 1. Explicit full URL override (highest priority)
+  const explicit = validateRpcUrl(process.env.NEXT_PUBLIC_HELIUS_RPC_URL);
   if (explicit) return explicit;
 
-  const apiKey = process.env.HELIUS_API_KEY ?? process.env.NEXT_PUBLIC_HELIUS_API_KEY ?? "";
+  // 2. Build from Helius API key
+  const apiKey = (process.env.HELIUS_API_KEY ?? "").trim();
   if (apiKey) {
     const net = process.env.NEXT_PUBLIC_DEFAULT_NETWORK?.trim();
     const network = net === "mainnet" ? "mainnet" : "devnet";
@@ -37,7 +58,14 @@ export function getRpcEndpoint(): string {
       : `https://devnet.helius-rpc.com/?api-key=${apiKey}`;
   }
 
-  return process.env.NEXT_PUBLIC_SOLANA_RPC_URL ?? "https://api.devnet.solana.com";
+  // 3. Generic Solana RPC URL (supports both env var names)
+  const solanaRpc =
+    validateRpcUrl(process.env.NEXT_PUBLIC_SOLANA_RPC_URL) ||
+    validateRpcUrl(process.env.SOLANA_RPC_URL);
+  if (solanaRpc) return solanaRpc;
+
+  // 4. Public fallback (rate-limited but prevents build failures)
+  return PUBLIC_DEVNET_RPC;
 }
 
 /**
@@ -47,7 +75,7 @@ export function getRpcEndpoint(): string {
  * Returns undefined if no Helius key is configured (disables WS subscriptions).
  */
 export function getWsEndpoint(): string | undefined {
-  const apiKey = process.env.NEXT_PUBLIC_HELIUS_API_KEY ?? "";
+  const apiKey = process.env.NEXT_PUBLIC_HELIUS_WS_API_KEY ?? process.env.NEXT_PUBLIC_HELIUS_API_KEY ?? "";
   if (!apiKey) return undefined;
 
   const net = getNetwork();
@@ -67,14 +95,18 @@ const CONFIGS = {
   devnet: {
     get rpcUrl() { return getRpcEndpoint(); },
     programId: "FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD",
-    matcherProgramId: "4HcGCsyjAqnFua5ccuXyt8KRRQzKFbGTJkVChpS7Yfzy",
+    matcherProgramId: "GTRgyTDfrMvBubALAqtHuQwT8tbGyXid7svXZKtWfC9k",
     crankWallet: "2JaSzRYrf44fPpQBtRJfnCEgThwCmvpFd3FCXi45VXxm",
     explorerUrl: "https://explorer.solana.com",
-    // Multiple program deployments for different slab sizes
+    // Multiple program deployments for different slab sizes (PERC-286).
+    // Each tier has its own on-chain program compiled with the appropriate --features flag.
+    // small:  256 slots  (~0.44 SOL rent) — --features small
+    // medium: 1024 slots (~1.8 SOL rent)  — --features medium
+    // large:  4096 slots (~7 SOL rent)    — default build (no features)
     programsBySlabTier: {
-      small: "FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD",   // 256 slots
-      medium: "FwfBKZXbYr4vTK23bMFkbgKq3npJ3MSDxEaKmq9Aj4Qn",  // 1024 slots
-      large: "g9msRSV3sJmmE3r5Twn9HuBsxzuuRGTjKCVTKudm9in",   // 4096 slots
+      small: "FwfBKZXbYr4vTK23bMFkbgKq3npJ3MSDxEaKmq9Aj4Qn",   // 256 slots
+      medium: "g9msRSV3sJmmE3r5Twn9HuBsxzuuRGTjKCVTKudm9in",   // 1024 slots
+      large: "FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD",    // 4096 slots (confirmed working)
     } as Record<string, string>,
   },
 } as const;

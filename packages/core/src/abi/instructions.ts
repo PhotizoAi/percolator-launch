@@ -44,6 +44,33 @@ export const IX_TAG = {
   WithdrawInsuranceLP: 26,
   PauseMarket: 27,
   UnpauseMarket: 28,
+  AcceptAdmin: 29,
+  SetInsuranceWithdrawPolicy: 30,
+  WithdrawInsuranceLimited: 31,
+  SetPythOracle: 32,
+  UpdateMarkPrice: 33,
+  UpdateHyperpMark: 34,
+  TradeCpiV2: 35,
+  UnresolveMarket: 36,
+  CreateLpVault: 37,
+  LpVaultDeposit: 38,
+  LpVaultWithdraw: 39,
+  LpVaultCrankFees: 40,
+  /** PERC-306: Fund per-market isolated insurance balance */
+  FundMarketInsurance: 41,
+  /** PERC-306: Set insurance isolation BPS for a market */
+  SetInsuranceIsolation: 42,
+  // Tag 43 is ChallengeSettlement on-chain (PERC-314).
+  // PERC-305 (ExecuteAdl) is NOT implemented on-chain — do NOT assign tag 43 here.
+  // When PERC-305 is implemented, assign a new unused tag (≥47).
+  /** PERC-314: Challenge settlement price during dispute window */
+  ChallengeSettlement: 43,
+  /** PERC-314: Resolve dispute (admin adjudication) */
+  ResolveDispute: 44,
+  /** PERC-315: Deposit LP vault tokens as perp collateral */
+  DepositLpCollateral: 45,
+  /** PERC-315: Withdraw LP collateral (position must be closed) */
+  WithdrawLpCollateral: 46,
 } as const;
 
 /**
@@ -272,6 +299,31 @@ export function encodeTradeCpi(args: TradeCpiArgs): Uint8Array {
     encU16(args.lpIdx),
     encU16(args.userIdx),
     encI128(args.size),
+  );
+}
+
+/**
+ * TradeCpiV2 instruction data (22 bytes) — PERC-154 optimized trade CPI.
+ *
+ * Same as TradeCpi but includes a caller-provided PDA bump byte.
+ * Uses create_program_address instead of find_program_address,
+ * saving ~1500 CU per trade. The bump should be obtained once via
+ * deriveLpPda() and cached for the lifetime of the market.
+ */
+export interface TradeCpiV2Args {
+  lpIdx: number;
+  userIdx: number;
+  size: bigint | string;
+  bump: number;
+}
+
+export function encodeTradeCpiV2(args: TradeCpiV2Args): Uint8Array {
+  return concatBytes(
+    encU8(IX_TAG.TradeCpiV2),
+    encU16(args.lpIdx),
+    encU16(args.userIdx),
+    encI128(args.size),
+    encU8(args.bump),
   );
 }
 
@@ -683,50 +735,36 @@ export function encodeUpdateHyperpMark(): Uint8Array {
 }
 
 // ============================================================================
-// MATCHER INSTRUCTIONS (sent to matcher program, not percolator)
+// PERC-306: Per-Market Insurance Isolation
 // ============================================================================
 
 /**
- * Matcher instruction tags
+ * Fund per-market isolated insurance balance.
+ * Accounts: [admin(signer,writable), slab(writable), admin_ata(writable), vault(writable), token_program]
  */
-export const MATCHER_IX_TAG = {
-  InitPassive: 0,
-  InitCurve: 1,
-  InitVamm: 2,
-} as const;
+export function encodeFundMarketInsurance(args: { amount: bigint }): Uint8Array {
+  return concatBytes(encU8(IX_TAG.FundMarketInsurance), encU64(args.amount));
+}
 
 /**
- * InitVamm matcher instruction data (66 bytes)
- * Tag 2 — configures a vAMM LP with spread/impact pricing.
- *
- * Layout: tag(1) + mode(1) + tradingFeeBps(4) + baseSpreadBps(4) +
- *         maxTotalBps(4) + impactKBps(4) + liquidityNotionalE6(16) +
- *         maxFillAbs(16) + maxInventoryAbs(16)
+ * Set insurance isolation BPS for a market.
+ * Accounts: [admin(signer), slab(writable)]
  */
-export interface InitVammArgs {
-  mode: number;                         // 0 = passive, 1 = vAMM
-  tradingFeeBps: number;                // Trading fee in bps (e.g. 5 = 0.05%)
-  baseSpreadBps: number;                // Base spread in bps (e.g. 10 = 0.10%)
-  maxTotalBps: number;                  // Max total (spread + impact + fee) in bps
-  impactKBps: number;                   // Impact coefficient at full liquidity
-  liquidityNotionalE6: bigint | string; // Notional liquidity for impact calc (e6)
-  maxFillAbs: bigint | string;          // Max fill per trade (abs units)
-  maxInventoryAbs: bigint | string;     // Max inventory (0 = unlimited)
+export function encodeSetInsuranceIsolation(args: { bps: number }): Uint8Array {
+  return concatBytes(encU8(IX_TAG.SetInsuranceIsolation), encU16(args.bps));
 }
 
-export function encodeInitVamm(args: InitVammArgs): Uint8Array {
-  return concatBytes(
-    encU8(MATCHER_IX_TAG.InitVamm),
-    encU8(args.mode),
-    encU32(args.tradingFeeBps),
-    encU32(args.baseSpreadBps),
-    encU32(args.maxTotalBps),
-    encU32(args.impactKBps),
-    encU128(args.liquidityNotionalE6),
-    encU128(args.maxFillAbs),
-    encU128(args.maxInventoryAbs),
-  );
-}
+// ============================================================================
+// PERC-305: Partial Auto-Deleveraging — NOT YET IMPLEMENTED ON-CHAIN
+// ============================================================================
+// encodeExecuteAdl() has been REMOVED. The on-chain program does NOT have an
+// ExecuteAdl instruction. Tag 43 is ChallengeSettlement (PERC-314).
+// Calling the old encodeExecuteAdl() would have invoked ChallengeSettlement
+// with a garbled data layout — a critical security vulnerability (PERC-319).
+//
+// When PERC-305 is implemented on-chain, add the encoder here with a new
+// unused tag (≥47). See tags.rs for the single source of truth.
+// ============================================================================
 
 // ============================================================================
 // SMART PRICE ROUTER — quote computation for LP selection

@@ -23,8 +23,9 @@ import {
   type EngineState,
   type RiskParams,
   type Account,
-} from "@percolator/core";
+} from "@percolator/sdk";
 import { isMockSlab, getMockSlabState } from "@/lib/mock-trade-data";
+import { isMockMode } from "@/lib/mock-mode";
 
 export interface SlabState {
   /** The slab account address this provider is tracking */
@@ -72,8 +73,8 @@ export const SlabProvider: FC<{ children: ReactNode; slabAddress: string }> = ({
       return;
     }
 
-    // Mock data mode — use synthetic data for design testing
-    if (isMockSlab(slabAddress)) {
+    // Mock data mode — use synthetic data for design testing (opt-in only)
+    if (isMockMode() && isMockSlab(slabAddress)) {
       const mock = getMockSlabState(slabAddress);
       if (mock) {
         setState({
@@ -101,17 +102,57 @@ export const SlabProvider: FC<{ children: ReactNode; slabAddress: string }> = ({
     }
     let cancelled = false;
 
+    // Current expected slab version — bump when program is upgraded with schema changes
+    const EXPECTED_SLAB_VERSION = 1;
+
     function parseSlab(data: Uint8Array, owner?: PublicKey) {
       if (cancelled) return;
       try {
         const header = parseHeader(data);
+
+        // Graceful version mismatch detection (bug #52f49b69)
+        if (header.version !== EXPECTED_SLAB_VERSION) {
+          setState((s) => ({
+            ...s,
+            loading: false,
+            error: `This market uses slab version ${header.version} but the current program expects version ${EXPECTED_SLAB_VERSION}. ` +
+              `The program was upgraded and this market needs migration. Please contact the market admin or create a new market.`,
+          }));
+          return;
+        }
+
         const config = parseConfig(data);
         const engine = parseEngine(data);
         const params = parseParams(data);
         const accounts = parseAllAccounts(data);
         setState((s) => ({ slabAddress, raw: data, header, config, engine, params, accounts, loading: false, error: null, programId: owner ?? s.programId }));
       } catch (e) {
-        setState((s) => ({ ...s, loading: false, error: e instanceof Error ? e.message : String(e) }));
+        const msg = e instanceof Error ? e.message : String(e);
+
+        // Detect version/layout mismatch errors that typically occur after a program upgrade.
+        // Common symptoms: unexpected data length, bad discriminator/magic, out-of-range reads.
+        const isLayoutMismatch =
+          msg.includes("out of range") ||
+          msg.includes("offset") ||
+          msg.includes("Invalid") ||
+          msg.includes("discriminator") ||
+          msg.includes("magic") ||
+          msg.includes("unexpected length") ||
+          msg.includes("buffer") ||
+          (data.length > 0 && data.length < 200); // Suspiciously small for a slab
+
+        if (isLayoutMismatch) {
+          setState((s) => ({
+            ...s,
+            loading: false,
+            error:
+              "This market's on-chain data format has changed (likely due to a program upgrade). " +
+              "Please refresh the page. If the issue persists, the market may need migration — " +
+              "contact the market admin or check the Percolator Discord for updates.",
+          }));
+        } else {
+          setState((s) => ({ ...s, loading: false, error: msg }));
+        }
       }
     }
 

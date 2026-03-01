@@ -4,7 +4,7 @@
  */
 const ERROR_CODE_MAP: Record<number, string> = {
   0: "Invalid market magic — data corrupted.",
-  1: "Version mismatch or insufficient token balance. If creating an account, make sure you have tokens.",
+  1: "This market was created with an older program version and needs migration. The program has been upgraded — please contact the market admin to migrate this market, or create a new market with the current program.",
   2: "Market already initialized.",
   3: "Market not initialized.",
   4: "Invalid slab data length — corrupted market.",
@@ -37,6 +37,17 @@ const ERROR_CODE_MAP: Record<number, string> = {
   31: "Insurance deposit/withdrawal amount must be > 0.",
   32: "Insurance LP supply mismatch.",
   33: "Market is paused — trading, deposits, and withdrawals are disabled by the admin.",
+  34: "Cannot renounce admin — the market must be resolved first.",
+  35: "Invalid confirmation code for admin renouncement.",
+  36: "Vault seed balance too low — deposit more tokens to the vault before creating the market.",
+  37: "DEX pool has insufficient liquidity for safe oracle bootstrapping.",
+  38: "LP vault already exists for this market.",
+  39: "LP vault not yet created — create it first.",
+  40: "LP vault amount must be greater than zero.",
+  41: "LP vault supply/capital mismatch — please report this error.",
+  42: "LP vault withdrawal exceeds available capital (some is reserved for open interest).",
+  43: "LP vault fee share out of range (must be 0–100%).",
+  44: "No new fees to distribute to LP vault yet.",
 };
 
 /** Legacy Anchor error map (unused but kept for compatibility) */
@@ -104,8 +115,11 @@ export function humanizeError(rawMsg: string): string {
   if (rawMsg.includes("Blockhash not found") || rawMsg.includes("block height exceeded") || rawMsg.includes("has expired")) {
     return "Transaction expired — network was slow. Try again, it usually works on the second attempt.";
   }
+  if (rawMsg.includes("Insufficient SOL")) {
+    return rawMsg; // Already a clear message from our pre-flight check
+  }
   if (rawMsg.includes("insufficient funds") || rawMsg.includes("Insufficient")) {
-    return "Insufficient token balance. Deposit or mint tokens first.";
+    return "Insufficient balance for transaction fees. Ensure you have enough SOL for fees and enough tokens for the trade.";
   }
   // Error code 1 can be either PercolatorError::InvalidVersion OR SPL Token InsufficientFunds from CPI
   if (rawMsg.includes("User rejected")) {

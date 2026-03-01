@@ -17,8 +17,8 @@ import {
   ACCOUNTS_PUSH_ORACLE_PRICE,
   derivePythPushOraclePDA,
   type DiscoveredMarket,
-} from "@percolator/core";
-import { config, getConnection, loadKeypair, sendWithRetry, pollSignatureStatus, getRecentPriorityFees, checkTransactionSize, eventBus, createLogger, sendWarningAlert, acquireToken, getFallbackConnection, backoffMs } from "@percolator/shared";
+} from "@percolator/sdk";
+import { config, getConnection, loadKeypair, sendWithRetry, sendWithRetryKeeper, pollSignatureStatus, getRecentPriorityFees, checkTransactionSize, eventBus, createLogger, sendWarningAlert, acquireToken, getFallbackConnection, backoffMs } from "@percolator/shared";
 import { OracleService } from "./oracle.js";
 
 const logger = createLogger("keeper:liquidation");
@@ -62,6 +62,64 @@ async function fetchSlabWithRetry(
 // BL2: Extract magic numbers to named constants
 const PRICE_E6_DIVISOR = 1_000_000n; // Price precision divisor (6 decimals)
 const BPS_MULTIPLIER = 10_000n; // Basis points multiplier (100% = 10000 bps)
+
+/**
+ * Oracle mode for a market.
+ * - 'pyth-pinned': oracle_authority == [0;32] && index_feed_id != [0;32]
+ *   → staleness enforced on-chain by Pyth CPI
+ * - 'hyperp': index_feed_id == [0;32]
+ *   → DEX oracle, authority_timestamp stores funding rate (not a real timestamp)
+ * - 'admin': oracle_authority != [0;32] && index_feed_id != [0;32]
+ *   → off-chain authority pushes prices; needs staleness check
+ */
+type OracleMode = "pyth-pinned" | "hyperp" | "admin";
+
+/**
+ * Detect oracle mode from market config keys.
+ * Centralizes mode detection so scanMarket and liquidate use identical logic.
+ */
+function detectOracleMode(cfg: { oracleAuthority: PublicKey; indexFeedId: PublicKey }): OracleMode {
+  const zeroKey = new PublicKey(new Uint8Array(32));
+  const isHyperp = cfg.indexFeedId.equals(zeroKey);
+  if (isHyperp) return "hyperp";
+  if (cfg.oracleAuthority.equals(zeroKey)) return "pyth-pinned";
+  return "admin";
+}
+
+/**
+ * Resolve the effective price for a market based on its oracle mode.
+ * Both scanMarket and liquidate call this to ensure identical price selection
+ * logic, including the staleness fallback for admin-oracle markets.
+ *
+ * Returns 0n if no valid price is available.
+ */
+function resolveMarketPrice(
+  cfg: {
+    oracleAuthority: PublicKey;
+    indexFeedId: PublicKey;
+    lastEffectivePriceE6: bigint;
+    authorityPriceE6: bigint;
+    authorityTimestamp: bigint;
+  },
+  mode: OracleMode,
+): { price: bigint; stale: boolean } {
+  if (mode === "pyth-pinned") {
+    return { price: cfg.lastEffectivePriceE6, stale: false };
+  }
+  if (mode === "hyperp") {
+    return { price: cfg.lastEffectivePriceE6, stale: false };
+  }
+  // Admin oracle: try authorityPriceE6 with off-chain staleness check
+  const now = BigInt(Math.floor(Date.now() / 1000));
+  const priceAge = cfg.authorityTimestamp > 0n ? now - cfg.authorityTimestamp : now;
+  const authorityFresh = cfg.authorityPriceE6 > 0n && priceAge <= 60n;
+
+  if (authorityFresh) {
+    return { price: cfg.authorityPriceE6, stale: false };
+  }
+  // Authority stale — fall back to lastEffectivePriceE6 (mirrors on-chain behavior)
+  return { price: cfg.lastEffectivePriceE6, stale: true };
+}
 
 interface LiquidationCandidate {
   slabAddress: string;
@@ -111,19 +169,44 @@ export class LiquidationService {
 
       const candidates: LiquidationCandidate[] = [];
       const maintenanceMarginBps = params.maintenanceMarginBps;
-      const price = cfg.authorityPriceE6;
 
-      if (price === 0n) return []; // No price set
+      // Determine oracle mode and resolve price via shared helpers
+      const oracleMode = detectOracleMode(cfg);
+      const { price: resolvedPrice, stale } = resolveMarketPrice(cfg, oracleMode);
 
-      // BC2: Check oracle staleness - reject if timestamp > 60s old
-      const now = BigInt(Math.floor(Date.now() / 1000));
-      const priceAge = cfg.authorityTimestamp > 0n ? now - cfg.authorityTimestamp : now;
-      if (priceAge > 60n) {
-        // Only log for markets with actual positions (reduce noise)
-        if (engine.totalOpenInterest > 0n) {
-          logger.warn("Stale oracle price, skipping", { slabAddress, priceAgeSeconds: Number(priceAge), maxAge: 60 });
+      let price: bigint;
+      if (oracleMode === "pyth-pinned") {
+        price = resolvedPrice;
+        if (price === 0n) return []; // No price resolved yet
+      } else if (oracleMode === "hyperp") {
+        price = resolvedPrice;
+        if (price === 0n) return []; // Market not bootstrapped yet
+
+        // Sanity check: mark price should also be non-zero in a healthy Hyperp market
+        if (cfg.authorityPriceE6 === 0n) {
+          if (engine.totalOpenInterest > 0n) {
+            logger.warn("Hyperp market has zero mark price, skipping", { slabAddress });
+          }
+          return [];
         }
-        return []; // Don't liquidate with stale prices
+      } else {
+        // Admin oracle — resolveMarketPrice handles staleness fallback
+        price = resolvedPrice;
+        if (price === 0n) {
+          if (engine.totalOpenInterest > 0n) {
+            logger.warn("No valid price (authority stale, no effective price), skipping", {
+              slabAddress,
+              authorityTimestamp: Number(cfg.authorityTimestamp),
+            });
+          }
+          return [];
+        }
+        if (stale) {
+          logger.debug("Authority price stale, using lastEffectivePriceE6", {
+            slabAddress,
+            lastEffectivePriceE6: price.toString(),
+          });
+        }
       }
 
       // Use bitmap to find actually-used account indices (not sequential iteration)
@@ -228,7 +311,7 @@ export class LiquidationService {
 
     try {
       const connection = getConnection();
-      const keypair = loadKeypair(config.crankKeypair);
+      const keypair = loadKeypair(process.env.CRANK_KEYPAIR!);
       const programId = market.programId;
 
       // Build multi-instruction tx: push price → crank → liquidate
@@ -294,7 +377,10 @@ export class LiquidationService {
           return null;
         }
 
-        const freshPrice = freshCfg.authorityPriceE6;
+        // Use the same price source as scanMarket via shared helpers
+        // (fixes bug where admin-oracle staleness fallback was missing here)
+        const freshMode = detectOracleMode(freshCfg);
+        const { price: freshPrice } = resolveMarketPrice(freshCfg, freshMode);
         if (freshPrice > 0n) {
           const notional = absBI(freshAccount.positionSize) * freshPrice / PRICE_E6_DIVISOR;
           if (notional > 0n) {
@@ -319,58 +405,16 @@ export class LiquidationService {
         }
       }
 
-      // Send all in one tx with retry (Bug 7+8+9)
-      const { Transaction } = await import("@solana/web3.js");
-      const MAX_RETRIES = 2;
-      let sig: string | null = null;
-      
-      // BH6 + BH11: Get dynamic priority fees and compute budget
-      const { priorityFeeMicroLamports, computeUnitLimit } = await getRecentPriorityFees(connection);
-      
-      for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-        try {
-          const tx = new Transaction();
-          
-          // BH6 + BH11: Add compute budget instructions at the start
-          tx.add(
-            ComputeBudgetProgram.setComputeUnitLimit({ units: computeUnitLimit }),
-            ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityFeeMicroLamports })
-          );
-          
-          for (const ix of instructions) {
-            tx.add(ix);
-          }
-          const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
-          tx.recentBlockhash = blockhash;
-          tx.feePayer = keypair.publicKey;
-          tx.sign(keypair);
-          
-          // BH9: Check transaction size before sending
-          checkTransactionSize(tx);
-          
-          const txSig = await connection.sendRawTransaction(tx.serialize(), {
-            skipPreflight: false,
-            preflightCommitment: "confirmed",
-          });
-          // Use getSignatureStatuses polling instead of confirmTransaction
-          // (confirmTransaction can falsely report "block height exceeded" on devnet)
-          await pollSignatureStatus(connection, txSig);
-          sig = txSig;
-          break;
-        } catch (retryErr) {
-          const errMsg = retryErr instanceof Error ? retryErr.message.toLowerCase() : String(retryErr).toLowerCase();
-          const isNetworkError = errMsg.includes("timeout") || errMsg.includes("socket") || errMsg.includes("econnrefused") || errMsg.includes("429") || errMsg.includes("block height exceeded");
-          if (!isNetworkError || attempt >= MAX_RETRIES) {
-            throw retryErr;
-          }
-          console.warn(`[LiquidationService] Attempt ${attempt + 1} failed with network error, retrying...`);
-          await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
-        }
-      }
+      // PERC-204: Use keeper-optimized send (skipPreflight + multi-RPC + tight CU)
+      // Replaces manual tx building with sendWithRetryKeeper for:
+      //   - skipPreflight=true (saves ~20-50ms)
+      //   - Multi-RPC parallel broadcast (+20-40% landing rate)
+      //   - Simulation-based tight CU limit (better queue position)
+      const sig = await sendWithRetryKeeper(connection, instructions, [keypair], 3);
 
       // BC1: Track signature to prevent replay attacks
       const now = Date.now();
-      this.recentSignatures.set(sig!, now);
+      this.recentSignatures.set(sig, now);
       // Clean up signatures older than TTL
       for (const [oldSig, timestamp] of this.recentSignatures.entries()) {
         if (now - timestamp > this.signatureTTLMs) {
@@ -381,7 +425,7 @@ export class LiquidationService {
       this.liquidationCount++;
       eventBus.publish("liquidation.success", slabAddress.toBase58(), {
         accountIdx,
-        signature: sig!,
+        signature: sig,
       });
       logger.info("Account liquidated", { accountIndex: accountIdx, slabAddress: slabAddress.toBase58(), signature: sig });
       
@@ -389,10 +433,10 @@ export class LiquidationService {
       await sendWarningAlert("Liquidation executed", [
         { name: "Market", value: slabAddress.toBase58().slice(0, 8), inline: true },
         { name: "Account Index", value: accountIdx.toString(), inline: true },
-        { name: "Signature", value: sig!.slice(0, 12), inline: true },
+        { name: "Signature", value: sig.slice(0, 12), inline: true },
       ]);
       
-      return sig!;
+      return sig;
     } catch (err) {
       logger.error("Liquidation failed", {
         error: err instanceof Error ? err.message : String(err),

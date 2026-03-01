@@ -5,14 +5,15 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useMarketDiscovery } from "@/hooks/useMarketDiscovery";
-import { computeMarketHealth } from "@/lib/health";
+import { computeMarketHealth, computeMarketHealthFromStats, sanitizeOnChainValue, isSentinelValue } from "@/lib/health";
 import { HealthBadge } from "@/components/market/HealthBadge";
 import { formatTokenAmount } from "@/lib/format";
 import { getSupabase } from "@/lib/supabase";
+import { isActiveMarket } from "@/lib/activeMarketFilter";
 import type { Database } from "@/lib/database.types";
 
 type MarketWithStats = Database['public']['Views']['markets_with_stats']['Row'];
-import type { DiscoveredMarket } from "@percolator/core";
+import type { DiscoveredMarket } from "@percolator/sdk";
 import { PublicKey } from "@solana/web3.js";
 import { ShimmerSkeleton } from "@/components/ui/ShimmerSkeleton";
 import { ScrollReveal } from "@/components/ui/ScrollReveal";
@@ -21,6 +22,7 @@ import { useMultiTokenMeta } from "@/hooks/useMultiTokenMeta";
 import { useAllMarketStats } from "@/hooks/useAllMarketStats";
 import { MarketLogo } from "@/components/market/MarketLogo";
 import { ErrorBoundary } from "@/components/ui/ErrorBoundary";
+import { detectOracleMode, resolveMarketPriceE6, priceE6ToUsd } from "@/lib/oraclePrice";
 
 function formatNum(n: number | null | undefined): string {
   if (n === null || n === undefined) return "\u2014";
@@ -33,6 +35,9 @@ function shortenAddress(addr: string, chars = 4): string {
   return `${addr.slice(0, chars)}...${addr.slice(-chars)}`;
 }
 
+/** Returns true if a numeric value looks like a u64::MAX sentinel (≈1.844e19). */
+const isSentinelNum = (v: number) => v > 1e18;
+
 type SortKey = "volume" | "oi" | "recent" | "health";
 type LeverageFilter = "all" | "5x" | "10x" | "20x";
 type OracleFilter = "all" | "admin" | "live";
@@ -44,7 +49,7 @@ interface MergedMarket {
   name: string | null;
   maxLeverage: number;
   isAdminOracle: boolean;
-  onChain: DiscoveredMarket;
+  onChain: DiscoveredMarket | null;  // null for Supabase-only markets not yet discovered on-chain
   supabase: MarketWithStats | null;
 }
 
@@ -92,6 +97,16 @@ function MarketsPageInner() {
   const searchParams = useSearchParams();
   const { markets: discovered, loading: discoveryLoading } = useMarketDiscovery();
   const { statsMap, loading: statsLoading } = useAllMarketStats();
+
+  // Canonical "active markets" count from Supabase (single source of truth)
+  // Uses shared isActiveMarket filter — consistent with homepage & /api/stats
+  const totalActiveMarkets = useMemo(() => {
+    let count = 0;
+    for (const m of statsMap.values()) {
+      if (isActiveMarket(m)) count++;
+    }
+    return count;
+  }, [statsMap]);
   
   // P-MED-2: Read filters from URL params
   const [search, setSearch] = useState(searchParams.get("q") || "");
@@ -127,24 +142,46 @@ function MarketsPageInner() {
   }, [debouncedSearch, sortBy, leverageFilter, oracleFilter, showUsd, router]);
 
   const merged = useMemo<MergedMarket[]>(() => {
-    return discovered
-      .filter((d) => {
-        // Skip malformed markets with undefined PublicKey fields
-        if (!d?.slabAddress || !d?.config?.collateralMint || !d?.config?.indexFeedId || !d?.params) {
-          console.warn("[Markets] Skipping malformed market:", d);
-          return false;
-        }
-        return true;
-      })
-      .map((d) => {
-        const addr = d.slabAddress.toBase58();
-        const mint = d.config.collateralMint.toBase58();
-        const maxLev = d.params.initialMarginBps > 0n ? Math.floor(10000 / Number(d.params.initialMarginBps)) : 0;
-        const isAdminOracle = d.config.indexFeedId.equals(PublicKey.default);
-        // Fetch stats from Supabase
-        const stats = statsMap.get(addr) || null;
-        return { slabAddress: addr, mintAddress: mint, symbol: null, name: null, maxLeverage: maxLev, isAdminOracle, onChain: d, supabase: stats };
+    const result: MergedMarket[] = [];
+    const seenSlabs = new Set<string>();
+
+    // 1. On-chain discovered markets (enriched with Supabase stats)
+    for (const d of discovered) {
+      if (!d?.slabAddress || !d?.config?.collateralMint || !d?.config?.indexFeedId || !d?.params) {
+        console.warn("[Markets] Skipping malformed market:", d);
+        continue;
+      }
+      const addr = d.slabAddress.toBase58();
+      const mint = d.config.collateralMint.toBase58();
+      const maxLev = d.params.initialMarginBps > 0n ? Math.floor(10000 / Number(d.params.initialMarginBps)) : 0;
+      const oracleMode = detectOracleMode(d.config);
+      const isAdminOracle = oracleMode === "hyperp" || oracleMode === "admin";
+      const stats = statsMap.get(addr) || null;
+      seenSlabs.add(addr);
+      result.push({ slabAddress: addr, mintAddress: mint, symbol: null, name: null, maxLeverage: maxLev, isAdminOracle, onChain: d, supabase: stats });
+    }
+
+    // 2. Supabase-only markets (not discovered on-chain — e.g., different tier, RPC limits)
+    for (const [slabAddr, stats] of statsMap) {
+      if (seenSlabs.has(slabAddr)) continue;
+      // Use Supabase fields for display
+      const mint = stats.mint_address ?? "";
+      const maxLev = stats.max_leverage ?? 10;
+      // Without on-chain data, we can't detect oracle mode — use Supabase oracle_authority hint
+      const isAdminOracle = stats.oracle_authority != null && stats.oracle_authority !== "";
+      result.push({
+        slabAddress: slabAddr,
+        mintAddress: mint,
+        symbol: null,
+        name: null,
+        maxLeverage: maxLev,
+        isAdminOracle,
+        onChain: null,
+        supabase: stats,
       });
+    }
+
+    return result;
   }, [discovered, statsMap]);
 
   // Only show mock data in development (never in production)
@@ -153,13 +190,45 @@ function MarketsPageInner() {
   // Fetch on-chain token metadata for ALL markets (no Supabase)
   const allMints = useMemo(() => {
     return effectiveMarkets
-      .filter(m => m.mintAddress)
-      .map(m => new PublicKey(m.mintAddress));
+      .filter(m => m.mintAddress && m.mintAddress.length >= 32)
+      .map(m => {
+        try { return new PublicKey(m.mintAddress); } catch { return null; }
+      })
+      .filter((pk): pk is PublicKey => pk !== null);
   }, [effectiveMarkets]);
   const tokenMetaMap = useMultiTokenMeta(allMints);
 
+  // Filter out empty/abandoned markets and flag bogus prices
+  // A market is "empty" if it has no meaningful data: no price, no volume, no OI
+  const activeMarkets = useMemo(() => {
+    // Helper: treat sentinel-like Supabase numbers (u64::MAX ≈ 1.844e19) as zero
+    const isSaneNum = (v: number) => v > 0 && v < 1e18 && Number.isFinite(v);
+    return effectiveMarkets.filter((m) => {
+      // Check on-chain price
+      const hasOnChainPrice = m.onChain?.config
+        ? resolveMarketPriceE6(m.onChain.config) > 0n
+        : false;
+      // Check Supabase price (with sentinel guard)
+      const hasSupabasePrice = isSaneNum(m.supabase?.last_price ?? 0);
+      // Check volume (with sentinel guard)
+      const hasVolume = isSaneNum(m.supabase?.volume_24h ?? 0);
+      // Check OI (with sentinel guard for both on-chain bigint and Supabase number)
+      const hasOI = m.onChain
+        ? sanitizeOnChainValue(m.onChain.engine?.totalOpenInterest ?? 0n) > 0n
+        : (isSaneNum(m.supabase?.total_open_interest ?? 0) ||
+           isSaneNum((m.supabase?.open_interest_long ?? 0) + (m.supabase?.open_interest_short ?? 0)));
+
+      // Keep market if it has at least a price (on-chain or Supabase)
+      return hasOnChainPrice || hasSupabasePrice || hasVolume || hasOI;
+    });
+  }, [effectiveMarkets]);
+
+  // Cap bogus prices: if a resolved price is above $1M per unit, it's almost certainly
+  // a display error from corrupted on-chain data. We'll clamp these in the display layer.
+  const MAX_SANE_PRICE_USD = 1_000_000; // $1M — no Percolator market should exceed this
+
   const filtered = useMemo(() => {
-    let list = effectiveMarkets;
+    let list = activeMarkets;
     // Text search — matches on-chain symbol, name, slab address, OR mint address
     if (debouncedSearch.trim()) {
       const q = debouncedSearch.toLowerCase();
@@ -183,21 +252,34 @@ function MarketsPageInner() {
     } else if (oracleFilter === "live") {
       list = list.filter((m) => !m.isAdminOracle);
     }
+    // Helper to get OI (prefer on-chain, fall back to Supabase)
+    // Sanitizes sentinel values (u64::MAX) to 0
+    const getOI = (m: MergedMarket): bigint => {
+      if (m.onChain) return sanitizeOnChainValue(m.onChain.engine.totalOpenInterest ?? 0n);
+      const supaOI = m.supabase?.total_open_interest
+        ?? ((m.supabase?.open_interest_long ?? 0) + (m.supabase?.open_interest_short ?? 0));
+      return BigInt(isSentinelNum(supaOI) ? 0 : Math.max(0, supaOI));
+    };
     list = [...list].sort((a, b) => {
       switch (sortBy) {
-        case "volume": 
-          // No Supabase volume data - sort by OI instead
-          const oiA_vol = a.onChain.engine.totalOpenInterest ?? 0n;
-          const oiB_vol = b.onChain.engine.totalOpenInterest ?? 0n;
-          return oiB_vol > oiA_vol ? 1 : oiB_vol < oiA_vol ? -1 : 0;
+        case "volume": {
+          // Prefer Supabase volume, fall back to OI
+          const volA = BigInt(a.supabase?.volume_24h ?? 0) || getOI(a);
+          const volB = BigInt(b.supabase?.volume_24h ?? 0) || getOI(b);
+          return volB > volA ? 1 : volB < volA ? -1 : 0;
+        }
         case "oi": {
-          const oiA = a.onChain.engine.totalOpenInterest ?? 0n;
-          const oiB = b.onChain.engine.totalOpenInterest ?? 0n;
+          const oiA = getOI(a);
+          const oiB = getOI(b);
           return oiB > oiA ? 1 : oiB < oiA ? -1 : 0;
         }
         case "health": {
-          const ha = computeMarketHealth(a.onChain.engine);
-          const hb = computeMarketHealth(b.onChain.engine);
+          const ha = a.onChain
+            ? computeMarketHealth(a.onChain.engine)
+            : (a.supabase ? computeMarketHealthFromStats(a.supabase) : { level: "empty" as const });
+          const hb = b.onChain
+            ? computeMarketHealth(b.onChain.engine)
+            : (b.supabase ? computeMarketHealthFromStats(b.supabase) : { level: "empty" as const });
           const order: Record<string, number> = { healthy: 0, caution: 1, warning: 2, empty: 3 };
           return (order[ha.level] ?? 5) - (order[hb.level] ?? 5);
         }
@@ -210,12 +292,38 @@ function MarketsPageInner() {
     return list;
   }, [effectiveMarkets, debouncedSearch, sortBy, leverageFilter, oracleFilter, tokenMetaMap]);
 
-  // P-MED-3: Infinite scroll observer
+  // P-MED-3: Progressive reveal + intersection observer backup
+  // Auto-load items in batches via requestAnimationFrame for instant display.
+  // The IntersectionObserver is kept as a secondary trigger for user-initiated scroll.
+  const filteredLengthRef = useRef(filtered.length);
+  filteredLengthRef.current = filtered.length;
+
+  // Primary: progressive auto-reveal (loads all items within ~200ms)
+  useEffect(() => {
+    if (discoveryLoading || statsLoading) return; // wait for data
+    if (displayCount >= filtered.length) return; // all shown
+
+    const handle = requestAnimationFrame(() => {
+      setDisplayCount((prev) => {
+        const total = filteredLengthRef.current;
+        if (prev >= total) return prev;
+        return Math.min(prev + 20, total);
+      });
+    });
+
+    return () => cancelAnimationFrame(handle);
+  }, [displayCount, filtered.length, discoveryLoading, statsLoading]);
+
+  // Secondary: IntersectionObserver for scroll-triggered loading (backup)
   useEffect(() => {
     const observer = new IntersectionObserver(
       (entries) => {
-        if (entries[0].isIntersecting && displayCount < filtered.length) {
-          setDisplayCount((prev) => Math.min(prev + 20, filtered.length));
+        if (entries[0].isIntersecting) {
+          setDisplayCount((prev) => {
+            const total = filteredLengthRef.current;
+            if (prev >= total) return prev;
+            return Math.min(prev + 20, total);
+          });
         }
       },
       { threshold: 0.1 }
@@ -231,7 +339,7 @@ function MarketsPageInner() {
         observer.unobserve(currentTarget);
       }
     };
-  }, [displayCount, filtered.length]);
+  }, [filtered.length]);
 
   // Reset display count when filters change
   useEffect(() => {
@@ -256,10 +364,10 @@ function MarketsPageInner() {
 
   return (
     <div className="min-h-[calc(100vh-48px)] relative">
-      {/* Grid background */}
-      <div className="absolute inset-x-0 top-0 h-48 bg-grid pointer-events-none" />
+      {/* Grid background — subtle decorative element */}
+      <div className="absolute inset-x-0 top-0 h-16 bg-grid pointer-events-none opacity-50" />
 
-      <div className="relative mx-auto max-w-4xl px-4 py-10">
+      <div className="relative mx-auto max-w-4xl px-4 pt-4 pb-10">
         {/* Header */}
         <ScrollReveal>
           <div className="mb-8 flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
@@ -424,9 +532,11 @@ function MarketsPageInner() {
               </button>
             )}
 
-            {/* Results count */}
+            {/* Results count — show filtered/total when filters are active */}
             <span className="ml-auto text-[10px] text-[var(--text-dim)]" style={{ fontFamily: "var(--font-mono)" }}>
-              {filtered.length} market{filtered.length !== 1 ? "s" : ""}
+              {(hasSearch || hasActiveFilters) && filtered.length !== totalActiveMarkets
+                ? `${filtered.length} / ${totalActiveMarkets} market${totalActiveMarkets !== 1 ? "s" : ""}`
+                : `${totalActiveMarkets} market${totalActiveMarkets !== 1 ? "s" : ""}`}
             </span>
           </div>
         </ScrollReveal>
@@ -462,36 +572,67 @@ function MarketsPageInner() {
             <>
               <div className="relative rounded-sm border border-[var(--border)] hud-corners overflow-x-auto">
                 {/* Header row - responsive grid columns */}
-                <div className="grid min-w-[500px] sm:min-w-[700px] grid-cols-[minmax(140px,2fr)_minmax(70px,1fr)_minmax(70px,1fr)_minmax(70px,1fr)_minmax(50px,0.7fr)] sm:grid-cols-[minmax(140px,2fr)_minmax(70px,1fr)_minmax(70px,1fr)_minmax(70px,1fr)_minmax(70px,1fr)_minmax(50px,0.7fr)_minmax(50px,0.7fr)] gap-3 border-b border-[var(--border)] bg-[var(--bg-surface)] px-4 py-2.5 text-[10px] font-medium uppercase tracking-[0.15em] text-[var(--text-dim)]">
+                <div className="grid min-w-[480px] sm:min-w-[700px] grid-cols-[minmax(100px,2fr)_minmax(55px,1fr)_minmax(55px,1fr)_minmax(55px,1fr)_minmax(50px,0.8fr)_minmax(35px,0.5fr)_minmax(40px,0.7fr)] sm:grid-cols-[minmax(140px,2fr)_minmax(70px,1fr)_minmax(70px,1fr)_minmax(70px,1fr)_minmax(70px,1fr)_minmax(50px,0.7fr)_minmax(50px,0.7fr)] gap-2 sm:gap-3 border-b border-[var(--border)] bg-[var(--bg-surface)] px-3 sm:px-4 py-2.5 text-[9px] sm:text-[10px] font-medium uppercase tracking-[0.15em] text-[var(--text-dim)]">
                   <div>token</div>
                   <div className="text-right">price</div>
                   <div className="text-right">OI</div>
-                  <div className="text-right">volume</div>
-                  <div className="text-right hidden sm:block">insurance</div>
-                  <div className="text-right hidden sm:block">max lev</div>
+                  <div className="text-right">vol</div>
+                  <div className="text-right"><span className="sm:hidden">ins</span><span className="hidden sm:inline">insurance</span></div>
+                  <div className="text-right"><span className="sm:hidden">lev</span><span className="hidden sm:inline">max lev</span></div>
                   <div className="text-right">health</div>
                 </div>
 
                 {displayedMarkets.map((m, i) => {
-                  const health = computeMarketHealth(m.onChain.engine);
-                  const lastPrice = m.supabase?.last_price;
+                  // Health: prefer on-chain data, fall back to Supabase stats
+                  const health = m.onChain
+                    ? computeMarketHealth(m.onChain.engine)
+                    : (m.supabase
+                      ? computeMarketHealthFromStats(m.supabase)
+                      : { level: "empty" as const, label: "No data", insuranceRatio: 0, capitalRatio: 0 });
                   
-                  // Token amounts
-                  const oiTokensRaw = m.onChain.engine.totalOpenInterest;
-                  const insuranceTokensRaw = m.onChain.engine.insuranceFund.balance;
-                  const volume24hRaw = m.supabase?.volume_24h != null ? BigInt(m.supabase.volume_24h) : null;
+                  // Price: prefer Supabase, fall back to oracle-mode-aware on-chain price
+                  // Cap bogus prices (corrupted on-chain data can produce $4.2T values)
+                  const onChainPriceE6 = m.onChain ? resolveMarketPriceE6(m.onChain.config) : 0n;
+                  const rawPrice = m.supabase?.last_price ?? priceE6ToUsd(onChainPriceE6);
+                  const lastPrice = rawPrice != null && rawPrice > MAX_SANE_PRICE_USD ? null : rawPrice;
+                  const rawDecimals = tokenMetaMap.get(m.mintAddress)?.decimals ?? (m.supabase?.decimals ?? 6);
+                  const mintDecimals = Math.min(Math.max(rawDecimals, 0), 18); // clamp to sane range
+                  const tokenDivisor = 10 ** mintDecimals;
                   
-                  // Display values (USD or tokens)
+                  // Token amounts: prefer on-chain, fall back to Supabase
+                  // Sanitize sentinel values (u64::MAX = uninitialized on-chain) → show as 0
+                  // PERC-234: Supabase values are raw on-chain values (NOT human-readable).
+                  // StatsCollector stores safeBigNum(engine.totalOpenInterest) etc. directly.
+                  // Do NOT multiply by tokenDivisor — that double-counts decimals.
+                  const oiTokensRaw = m.onChain
+                    ? sanitizeOnChainValue(m.onChain.engine.totalOpenInterest)
+                    : (() => {
+                        const v = m.supabase?.total_open_interest ?? ((m.supabase?.open_interest_long ?? 0) + (m.supabase?.open_interest_short ?? 0));
+                        const safe = isSentinelNum(v) ? 0 : Math.max(0, v);
+                        return BigInt(Math.round(safe));
+                      })();
+                  const insuranceTokensRaw = m.onChain
+                    ? sanitizeOnChainValue(m.onChain.engine.insuranceFund.balance)
+                    : (() => {
+                        const v = m.supabase?.insurance_balance ?? m.supabase?.insurance_fund ?? 0;
+                        const safe = isSentinelNum(v) ? 0 : Math.max(0, v);
+                        return BigInt(Math.round(safe));
+                      })();
+                  const volume24hRaw = m.supabase?.volume_24h != null && !isSentinelNum(m.supabase.volume_24h) && m.supabase.volume_24h > 0
+                    ? BigInt(Math.round(m.supabase.volume_24h))
+                    : null;
+                  
+                  // Display values (USD or tokens) — cap token display at 2dp for table readability
                   const oiDisplay = showUsd && lastPrice != null
-                    ? formatNum((Number(oiTokensRaw) / 1e6) * lastPrice)
-                    : formatTokenAmount(oiTokensRaw);
+                    ? formatNum(Math.round((Number(oiTokensRaw) / tokenDivisor) * lastPrice * 100) / 100)
+                    : formatTokenAmount(oiTokensRaw, mintDecimals, 2);
                   const insuranceDisplay = showUsd && lastPrice != null
-                    ? formatNum((Number(insuranceTokensRaw) / 1e6) * lastPrice)
-                    : formatTokenAmount(insuranceTokensRaw);
+                    ? formatNum(Math.round((Number(insuranceTokensRaw) / tokenDivisor) * lastPrice * 100) / 100)
+                    : formatTokenAmount(insuranceTokensRaw, mintDecimals, 2);
                   const volumeDisplay = volume24hRaw != null
                     ? (showUsd && lastPrice != null
-                        ? formatNum((Number(volume24hRaw) / 1e6) * lastPrice)
-                        : formatTokenAmount(volume24hRaw))
+                        ? formatNum(Math.round((Number(volume24hRaw) / tokenDivisor) * lastPrice * 100) / 100)
+                        : formatTokenAmount(volume24hRaw, mintDecimals, 2))
                     : null;
 
                   return (
@@ -499,22 +640,54 @@ function MarketsPageInner() {
                       key={m.slabAddress}
                       href={`/trade/${m.slabAddress}`}
                       className={[
-                        "grid min-w-[500px] sm:min-w-[700px] grid-cols-[minmax(140px,2fr)_minmax(70px,1fr)_minmax(70px,1fr)_minmax(70px,1fr)_minmax(50px,0.7fr)] sm:grid-cols-[minmax(140px,2fr)_minmax(70px,1fr)_minmax(70px,1fr)_minmax(70px,1fr)_minmax(70px,1fr)_minmax(50px,0.7fr)_minmax(50px,0.7fr)] gap-3 items-center px-4 py-3 transition-all duration-200 hover:bg-[var(--accent)]/[0.04] hover:border-l-2 hover:border-l-[var(--accent)]/30",
+                        "grid min-w-[480px] sm:min-w-[700px] grid-cols-[minmax(100px,2fr)_minmax(55px,1fr)_minmax(55px,1fr)_minmax(55px,1fr)_minmax(50px,0.8fr)_minmax(35px,0.5fr)_minmax(40px,0.7fr)] sm:grid-cols-[minmax(140px,2fr)_minmax(70px,1fr)_minmax(70px,1fr)_minmax(70px,1fr)_minmax(70px,1fr)_minmax(50px,0.7fr)_minmax(50px,0.7fr)] gap-2 sm:gap-3 items-center px-3 sm:px-4 py-3 transition-all duration-200 hover:bg-[var(--accent)]/[0.04] hover:border-l-2 hover:border-l-[var(--accent)]/30",
                         i > 0 ? "border-t border-[var(--border)]" : "",
                       ].join(" ")}
                     >
                       <div>
                         <div className="flex items-center gap-2">
-                          <MarketLogo logoUrl={m.supabase?.logo_url} symbol={tokenMetaMap.get(m.mintAddress)?.symbol ?? undefined} size="sm" />
+                          <MarketLogo logoUrl={m.supabase?.logo_url} mintAddress={m.mintAddress} symbol={tokenMetaMap.get(m.mintAddress)?.symbol ?? undefined} size="sm" />
                           <span className="font-semibold text-white text-sm">
-                            {tokenMetaMap.get(m.mintAddress)?.symbol ? `${tokenMetaMap.get(m.mintAddress)!.symbol}/USD` : shortenAddress(m.slabAddress)}
+                            {(() => {
+                              // Helper: detect if a symbol is a truncated address (auto-registered placeholder)
+                              const isPlaceholderSymbol = (sym: string | null | undefined, mint: string): boolean => {
+                                if (!sym) return true;
+                                // Reject if it's the first N chars of the mint address (StatsCollector default)
+                                if (mint.startsWith(sym)) return true;
+                                // Reject pure hex-like strings (8 chars)
+                                if (/^[0-9a-fA-F]{8}$/.test(sym)) return true;
+                                // Reject if it looks like a truncated address with ellipsis
+                                if (/^[A-Za-z0-9]{3,6}\.\.\.[A-Za-z0-9]{3,6}$/.test(sym)) return true;
+                                return false;
+                              };
+                              const onChainSym = tokenMetaMap.get(m.mintAddress)?.symbol;
+                              const supabaseSym = m.supabase?.symbol;
+                              const sym = (!isPlaceholderSymbol(onChainSym, m.mintAddress) ? onChainSym : null)
+                                || (!isPlaceholderSymbol(supabaseSym, m.mintAddress) && supabaseSym && supabaseSym.length <= 10 ? supabaseSym : null);
+                              return sym ? `${sym}/USD` : shortenAddress(m.slabAddress);
+                            })()}
                           </span>
                           {m.isAdminOracle && (
                             <span className="border border-[var(--text-dim)]/30 bg-[var(--text-dim)]/[0.08] px-1.5 py-0.5 text-[8px] font-medium uppercase tracking-wider text-[var(--text-dim)]">manual</span>
                           )}
                         </div>
                         <div className="text-[10px] text-[var(--text-dim)]" style={{ fontFamily: "var(--font-mono)" }}>
-                          {tokenMetaMap.get(m.mintAddress)?.name ? `${tokenMetaMap.get(m.mintAddress)!.name} · ${shortenAddress(m.mintAddress)}` : shortenAddress(m.mintAddress)}
+                          {(() => {
+                            const onChainName = tokenMetaMap.get(m.mintAddress)?.name;
+                            const supabaseName = m.supabase?.name;
+                            // Filter out placeholder names like "Market XXXXXXXX"
+                            const isPlaceholderName = (n: string | null | undefined): boolean => {
+                              if (!n) return true;
+                              if (/^Market [A-Za-z0-9]{6,}$/.test(n)) return true;
+                              if (n.length <= 8 && m.mintAddress.startsWith(n)) return true;
+                              // Filter truncated addresses used as names
+                              if (/^[A-Za-z0-9]{3,6}\.\.\.[A-Za-z0-9]{3,6}$/.test(n)) return true;
+                              return false;
+                            };
+                            const name = (!isPlaceholderName(onChainName) ? onChainName : null)
+                              || (!isPlaceholderName(supabaseName) ? supabaseName : null);
+                            return name ? `${name} · ${shortenAddress(m.mintAddress)}` : shortenAddress(m.mintAddress);
+                          })()}
                         </div>
                       </div>
                       <div className="text-right truncate">
@@ -528,20 +701,34 @@ function MarketsPageInner() {
                       <div className="text-right text-sm text-[var(--text-secondary)] truncate" style={{ fontFamily: "var(--font-jetbrains-mono)" }}>
                         {volumeDisplay ?? "\u2014"}
                       </div>
-                      <div className="text-right text-sm text-[var(--text)] truncate hidden sm:block" style={{ fontFamily: "var(--font-jetbrains-mono)" }}>{insuranceDisplay}</div>
-                      <div className="text-right text-sm text-[var(--text-secondary)] hidden sm:block">{m.maxLeverage}x</div>
+                      <div className="text-right text-sm text-[var(--text)] truncate" style={{ fontFamily: "var(--font-jetbrains-mono)" }}>{insuranceDisplay}</div>
+                      <div className="text-right text-sm text-[var(--text-secondary)]">{m.maxLeverage}x</div>
                       <div className="text-right"><HealthBadge level={health.level} /></div>
                     </Link>
                   );
                 })}
               </div>
               
-              {/* P-MED-3: Infinite scroll trigger */}
-              {displayCount < filtered.length && (
-                <div ref={observerTarget} className="py-4 text-center">
-                  <div className="inline-block h-6 w-6 animate-spin rounded-full border-2 border-[var(--accent)] border-t-transparent" />
+              {/* P-MED-3: Infinite scroll trigger / end-of-list */}
+              {displayCount < filtered.length ? (
+                <div ref={observerTarget} className="flex items-center justify-center gap-2 py-4">
+                  <div className="inline-block h-5 w-5 animate-spin rounded-full border-2 border-[var(--accent)] border-t-transparent" />
+                  <span className="text-xs text-[var(--text-muted)]">Loading more…</span>
                 </div>
-              )}
+              ) : filtered.length > 20 ? (
+                <div className="flex items-center justify-center gap-3 py-4">
+                  <span className="text-[11px] text-[var(--text-dim)]" style={{ fontFamily: "var(--font-mono)" }}>
+                    all {filtered.length} market{filtered.length !== 1 ? "s" : ""} loaded
+                  </span>
+                  <button
+                    onClick={() => window.scrollTo({ top: 0, behavior: "smooth" })}
+                    className="text-[11px] text-[var(--accent)]/60 hover:text-[var(--accent)] transition-colors"
+                    aria-label="Scroll to top"
+                  >
+                    ↑ top
+                  </button>
+                </div>
+              ) : null}
             </>
           )}
           </ScrollReveal>
@@ -554,8 +741,9 @@ function MarketsPageInner() {
 export default function MarketsPage() {
   return (
     <Suspense fallback={
-      <div className="min-h-[calc(100vh-48px)] flex items-center justify-center">
+      <div className="min-h-[calc(100vh-48px)] flex flex-col items-center justify-center gap-3">
         <div className="h-8 w-8 animate-spin rounded-full border-2 border-[var(--accent)] border-t-transparent" />
+        <span className="text-xs text-[var(--text-muted)]">Loading markets…</span>
       </div>
     }>
       <MarketsPageInner />

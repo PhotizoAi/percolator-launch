@@ -95,13 +95,12 @@ export const ACCOUNTS_KEEPER_CRANK: readonly AccountSpec[] = [
 ] as const;
 
 /**
- * TradeNoCpi: 5 accounts
+ * TradeNoCpi: 4 accounts (PERC-199: clock sysvar removed — uses Clock::get() syscall)
  */
 export const ACCOUNTS_TRADE_NOCPI: readonly AccountSpec[] = [
   { name: "user", signer: true, writable: true },
   { name: "lp", signer: true, writable: true },
   { name: "slab", signer: false, writable: true },
-  { name: "clock", signer: false, writable: false },
   { name: "oracle", signer: false, writable: false },
 ] as const;
 
@@ -142,13 +141,12 @@ export const ACCOUNTS_TOPUP_INSURANCE: readonly AccountSpec[] = [
 ] as const;
 
 /**
- * TradeCpi: 8 accounts
+ * TradeCpi: 7 accounts (PERC-199: clock sysvar removed — uses Clock::get() syscall)
  */
 export const ACCOUNTS_TRADE_CPI: readonly AccountSpec[] = [
   { name: "user", signer: true, writable: true },
   { name: "lpOwner", signer: false, writable: false },  // LP delegated to matcher - no signature needed
   { name: "slab", signer: false, writable: true },
-  { name: "clock", signer: false, writable: false },
   { name: "oracle", signer: false, writable: false },
   { name: "matcherProg", signer: false, writable: false },
   { name: "matcherCtx", signer: false, writable: true },
@@ -205,6 +203,15 @@ export const ACCOUNTS_SET_ORACLE_AUTHORITY: readonly AccountSpec[] = [
 ] as const;
 
 /**
+ * SetOraclePriceCap: 2 accounts
+ * Set oracle price circuit breaker cap (admin only)
+ */
+export const ACCOUNTS_SET_ORACLE_PRICE_CAP: readonly AccountSpec[] = [
+  { name: "admin", signer: true, writable: true },
+  { name: "slab", signer: false, writable: true },
+] as const;
+
+/**
  * PushOraclePrice: 2 accounts
  * Push oracle price (oracle authority only)
  */
@@ -233,17 +240,6 @@ export const ACCOUNTS_WITHDRAW_INSURANCE: readonly AccountSpec[] = [
   { name: "vault", signer: false, writable: true },
   { name: "tokenProgram", signer: false, writable: false },
   { name: "vaultPda", signer: false, writable: false },
-] as const;
-
-/**
- * InitVamm (matcher instruction): 4 accounts
- * Sent to the matcher program to configure a vAMM context for an LP.
- */
-export const ACCOUNTS_INIT_VAMM: readonly AccountSpec[] = [
-  { name: "lpOwner", signer: true, writable: true },
-  { name: "matcherCtx", signer: false, writable: true },
-  { name: "slab", signer: false, writable: false },
-  { name: "lpPda", signer: false, writable: false },
 ] as const;
 
 /**
@@ -330,6 +326,38 @@ export const ACCOUNTS_WITHDRAW_INSURANCE_LP: readonly AccountSpec[] = [
   { name: "insLpMint", signer: false, writable: true },
   { name: "withdrawerLpAta", signer: false, writable: true },
   { name: "vaultAuthority", signer: false, writable: false },
+] as const;
+
+/**
+ * FundMarketInsurance: 5 accounts (PERC-306)
+ * Fund per-market isolated insurance balance.
+ */
+export const ACCOUNTS_FUND_MARKET_INSURANCE: readonly AccountSpec[] = [
+  { name: "admin", signer: true, writable: true },
+  { name: "slab", signer: false, writable: true },
+  { name: "adminAta", signer: false, writable: true },
+  { name: "vault", signer: false, writable: true },
+  { name: "tokenProgram", signer: false, writable: false },
+] as const;
+
+/**
+ * SetInsuranceIsolation: 2 accounts (PERC-306)
+ * Set max % of global fund this market can access.
+ */
+export const ACCOUNTS_SET_INSURANCE_ISOLATION: readonly AccountSpec[] = [
+  { name: "admin", signer: true, writable: false },
+  { name: "slab", signer: false, writable: true },
+] as const;
+
+/**
+ * ExecuteAdl: NOT IMPLEMENTED ON-CHAIN (PERC-305 pending).
+ * Tag 43 is ChallengeSettlement (PERC-314). This constant is retained
+ * for reference only — do NOT use it to build instructions.
+ * @deprecated PERC-305 is not deployed. Using this would invoke ChallengeSettlement.
+ */
+export const ACCOUNTS_EXECUTE_ADL: readonly AccountSpec[] = [
+  { name: "keeper", signer: true, writable: false },
+  { name: "slab", signer: false, writable: true },
 ] as const;
 
 // ============================================================================
