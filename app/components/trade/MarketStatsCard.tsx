@@ -13,6 +13,8 @@ import { resolveMarketPriceE6 } from "@/lib/oraclePrice";
 import { FundingRateCard } from "./FundingRateCard";
 import { FundingRateChart } from "./FundingRateChart";
 import { sanitizeSymbol } from "@/lib/symbol-utils";
+import { useAllMarketStats } from "@/hooks/useAllMarketStats";
+import { isSaneMarketValue } from "@/lib/activeMarketFilter";
 
 function formatNum(n: number): string {
   if (n >= 1_000_000) return `$${(n / 1_000_000).toFixed(1)}M`;
@@ -30,6 +32,7 @@ export const MarketStatsCard: FC = () => {
   const mintAddress = mktConfig?.collateralMint?.toBase58() ?? "";
   const symbol = sanitizeSymbol(tokenMeta?.symbol, mintAddress);
   const [showFundingChart, setShowFundingChart] = useState(false);
+  const { statsMap } = useAllMarketStats();
 
   if (loading || !engine || !config || !params) {
     return (
@@ -51,8 +54,17 @@ export const MarketStatsCard: FC = () => {
     ? formatNum((Number(vault) / tokenDivisor) * priceUsd)
     : formatTokenAmount(vault, decimals);
 
+  const marketDbStats = slabAddress ? statsMap.get(slabAddress) : undefined;
+  const vol24hRaw = marketDbStats?.volume_24h ?? 0;
+  const vol24hDisplay = isSaneMarketValue(vol24hRaw)
+    ? (showUsd && priceUsd != null
+        ? formatNum((vol24hRaw / tokenDivisor) * priceUsd)
+        : formatTokenAmount(BigInt(Math.trunc(vol24hRaw)), decimals))
+    : "—";
+
   const stats = [
     { label: `${symbol} Price`, value: formatUsd(livePriceE6 ?? (mktConfig ? resolveMarketPriceE6(mktConfig) : 0n)) },
+    { label: "24h Volume", value: vol24hDisplay },
     { label: "Open Interest", value: oiDisplay },
     { label: "Vault", value: vaultDisplay },
     { label: "Trading Fee", value: formatBps(params.tradingFeeBps) },
