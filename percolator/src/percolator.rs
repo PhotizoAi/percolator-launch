@@ -1300,8 +1300,12 @@ impl RiskEngine {
 
         // Deduct from fee_credits (coupon: no insurance booking here —
         // insurance was already paid when credits were granted)
+        // Bug A fix: use u128_to_i128_clamped instead of plain `as i128` cast.
+        // If `due` exceeds i128::MAX the plain cast wraps to a negative value; then
+        // saturating_sub(negative) ADDS to fee_credits rather than subtracting,
+        // silently zeroing out the fee charge.
         self.accounts[idx as usize].fee_credits =
-            self.accounts[idx as usize].fee_credits.saturating_sub(due as i128);
+            self.accounts[idx as usize].fee_credits.saturating_sub(u128_to_i128_clamped(due));
 
         // If fee_credits is negative, pay from capital using set_capital helper (spec §4.1)
         let mut paid_from_capital = 0u128;
@@ -1362,8 +1366,9 @@ impl RiskEngine {
 
         // Deduct from fee_credits (coupon: no insurance booking here —
         // insurance was already paid when credits were granted)
+        // Bug A fix: use u128_to_i128_clamped instead of plain `as i128` cast.
         self.accounts[idx as usize].fee_credits =
-            self.accounts[idx as usize].fee_credits.saturating_sub(due as i128);
+            self.accounts[idx as usize].fee_credits.saturating_sub(u128_to_i128_clamped(due));
 
         // If negative, pay what we can from capital using set_capital helper (spec §4.1)
         let mut paid_from_capital = 0u128;
@@ -1481,9 +1486,12 @@ impl RiskEngine {
         self.insurance_fund.fee_revenue = self.insurance_fund.fee_revenue + amount;
 
         // Credit the account
+        // Bug B fix: use u128_to_i128_clamped instead of plain `as i128` cast.
+        // If `amount` exceeds i128::MAX the plain cast wraps to a negative value;
+        // saturating_add(negative) would DECREASE fee_credits instead of increasing them.
         self.accounts[idx as usize].fee_credits = self.accounts[idx as usize]
             .fee_credits
-            .saturating_add(amount as i128);
+            .saturating_add(u128_to_i128_clamped(amount));
 
         Ok(())
     }
@@ -1495,9 +1503,10 @@ impl RiskEngine {
         if idx as usize >= MAX_ACCOUNTS || !self.is_used(idx as usize) {
             return Err(RiskError::Unauthorized);
         }
+        // Bug B fix: use u128_to_i128_clamped instead of plain `as i128` cast.
         self.accounts[idx as usize].fee_credits = self.accounts[idx as usize]
             .fee_credits
-            .saturating_add(amount as i128);
+            .saturating_add(u128_to_i128_clamped(amount));
         Ok(())
     }
 
@@ -3005,7 +3014,8 @@ impl RiskEngine {
 
             // Deduct from fee_credits (coupon: no insurance booking here —
             // insurance was already paid when credits were granted)
-            account.fee_credits = account.fee_credits.saturating_sub(due as i128);
+            // Bug A fix: use u128_to_i128_clamped instead of plain `as i128` cast.
+            account.fee_credits = account.fee_credits.saturating_sub(u128_to_i128_clamped(due));
         }
 
         // Pay any owed fees from deposit first
@@ -3953,7 +3963,27 @@ impl RiskEngine {
         let lp_cap_for_acc = self.lp_capital_tot.get();
         if lp_fee_share > 0 && lp_cap_for_acc > 0 {
             // acc_delta = lp_fee_share * 1e12 / lp_capital_tot (per-unit, scaled 1e12)
-            let acc_delta = mul_u128(lp_fee_share, 1_000_000_000_000u128) / lp_cap_for_acc;
+            //
+            // Bug C fix: `mul_u128` uses saturating_mul, so when lp_fee_share is large
+            // (e.g. max-size max-fee trade: lp_fee_share ≈ 10^29 > u128::MAX/1e12 ≈ 3.4×10^26),
+            // the product saturates to u128::MAX, and acc_delta ≈ u128::MAX.
+            // After ONE such trade, `lp_fee_acc_per_unit_e12.saturating_add(u128::MAX) ==
+            // u128::MAX` and every subsequent LP snapshot advances to u128::MAX. All future
+            // fee additions produce delta = 0 → LP fee distribution permanently frozen.
+            //
+            // Fix: detect potential overflow and use divide-first form to keep acc_delta
+            // representable. Small precision loss on the truncated remainder is acceptable
+            // vs. permanently bricking the fee accumulator.
+            const SCALE: u128 = 1_000_000_000_000u128;
+            let acc_delta = if lp_fee_share <= u128::MAX / SCALE {
+                // No overflow risk: multiply then divide (full precision)
+                lp_fee_share * SCALE / lp_cap_for_acc
+            } else {
+                // Would overflow: divide first then scale.
+                // Cap per_unit at u128::MAX / SCALE so the final multiply stays in range.
+                let per_unit = (lp_fee_share / lp_cap_for_acc).min(u128::MAX / SCALE);
+                per_unit * SCALE
+            };
             self.lp_fee_acc_per_unit_e12 =
                 self.lp_fee_acc_per_unit_e12.saturating_add(acc_delta);
         }
