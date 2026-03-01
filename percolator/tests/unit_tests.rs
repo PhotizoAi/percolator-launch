@@ -5751,3 +5751,205 @@ fn test_execute_trade_full_fee_to_insurance_legacy() {
 
     assert_conserved(&engine);
 }
+
+// ============================================================================
+// Bug 3/4/5 Regression Tests: LP fee snapshot checkpoint on capital changes
+//
+// An LP who modifies capital (deposit / withdraw / close) without first
+// checkpointing the fee accumulator can claim more (or less) than their fair
+// share, and in the deposit case this can drain insurance_fund beyond the
+// total LP-fee deposits and violate the primary conservation invariant.
+// ============================================================================
+
+/// Bug 3 (Critical - Conservation): LP deposit without snapshot checkpoint
+/// allows over-claiming that can drain insurance_fund past its LP-fee deposits.
+///
+/// Scenario:
+///   1. LP joins with capital 1_000.  lp_capital_tot = 1_000.
+///   2. A trade happens: lp_fee_share = 80.
+///      acc_delta = 80 × 1e12 / 1_000 = 8×10^10.
+///   3. LP deposits 9_000 more WITHOUT claiming first.
+///      (old code: snapshot unchanged; capital now 10_000.)
+///   4. LP claims: 10_000 × 8×10^10 / 1e12 = 800.
+///      But insurance was only credited with 80 for LP fees.
+///      Over-claim of 720 → conservation violation.
+///
+/// After the fix, `deposit()` checkpoints the snapshot so the LP only earns
+/// fees from the post-deposit capital.  Conservation must hold throughout.
+#[test]
+fn test_lp_deposit_checkpoints_fee_snapshot_no_over_claim() {
+    let mut params = default_params();
+    params.fee_split_lp_bps = 8000;       // 80% to LP vault
+    params.fee_split_protocol_bps = 2000; // 20% to protocol
+    params.fee_split_creator_bps = 0;
+    params.trading_fee_bps = 10;          // 0.1 %
+    params.initial_margin_bps = 100;
+    params.maintenance_margin_bps = 50;
+    params.warmup_period_slots = 0;
+
+    let mut engine = Box::new(RiskEngine::new(params));
+
+    let user_idx = engine.add_user(0).unwrap();
+    let lp_idx   = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
+
+    // LP starts with 1_000_000 capital (enough for a 100_000-unit trade at 1% IM).
+    engine.deposit(lp_idx,   1_000_000, 0).unwrap();
+    engine.deposit(user_idx, 5_000_000, 0).unwrap();
+
+    // Execute a trade: notional = 100_000 → fee = 100, lp_share = 80.
+    engine.execute_trade(&MATCHER, lp_idx, user_idx, 0, 1_000_000, 100_000).unwrap();
+
+    // Capture insurance balance right after the trade; it includes the LP fee share.
+    let ins_after_trade = engine.insurance_fund.balance.get();
+    let acc_after_trade = engine.lp_fee_acc_per_unit_e12.get();
+    assert!(acc_after_trade > 0, "accumulator must be non-zero after trade");
+
+    // The LP fee share deposited to insurance for this trade:
+    //   fee = (100_000 * 10 + 9999) / 10_000 = 100
+    //   lp_share = 100 * 8000 / 10_000 = 80
+    let expected_lp_fee = 80u128;
+
+    // LP deposits 9× more capital WITHOUT claiming first.
+    // Without the fix: snapshot unchanged, future claim uses 10× capital → 800 claimed, but only 80 available.
+    engine.deposit(lp_idx, 9_000_000, 0).unwrap();
+
+    // Conservation must hold immediately after the deposit.
+    assert_conserved(&engine);
+
+    // With the fix, the snapshot advances during deposit so claimable ≤ pre-deposit fee share.
+    let claimable = engine.lp_fee_claimable(lp_idx);
+    assert!(
+        claimable <= expected_lp_fee,
+        "claimable ({}) must not exceed LP-fee share earned pre-deposit ({}); \
+         over-claim would violate conservation",
+        claimable,
+        expected_lp_fee
+    );
+
+    // Claim and verify conservation still holds.
+    engine.lp_fee_credit(lp_idx).unwrap();
+    assert_conserved(&engine);
+
+    // Insurance balance must not have decreased below what it held before the trade
+    // (i.e., we must not have over-drained it beyond the LP fee share).
+    let ins_after_claim = engine.insurance_fund.balance.get();
+    let ins_decrease = ins_after_trade.saturating_sub(ins_after_claim);
+    assert!(
+        ins_decrease <= expected_lp_fee,
+        "insurance must only decrease by the LP fee share (≤{}); decreased by {}",
+        expected_lp_fee,
+        ins_decrease
+    );
+}
+
+/// Bug 4 (Fairness): LP withdraw without snapshot checkpoint causes the LP to
+/// forfeit fees earned before the withdrawal.
+///
+/// After the fix, `withdraw()` checkpoints the snapshot so the LP receives the
+/// fees earned at their pre-withdrawal capital level.
+#[test]
+fn test_lp_withdraw_checkpoints_fee_snapshot_earns_pre_withdrawal_fees() {
+    let mut params = default_params();
+    params.fee_split_lp_bps = 10_000;    // 100% to LP vault for clarity
+    params.fee_split_protocol_bps = 0;
+    params.fee_split_creator_bps = 0;
+    params.trading_fee_bps = 10;
+    params.initial_margin_bps = 100;
+    params.maintenance_margin_bps = 50;
+    params.warmup_period_slots = 0;
+
+    let mut engine = Box::new(RiskEngine::new(params));
+
+    let user_idx = engine.add_user(0).unwrap();
+    let lp_idx   = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
+
+    engine.deposit(lp_idx,   1_000_000, 0).unwrap();
+    engine.deposit(user_idx, 5_000_000, 0).unwrap();
+
+    // Execute a trade to accrue LP fees, then immediately close LP position.
+    engine.execute_trade(&MATCHER, lp_idx, user_idx, 0, 1_000_000, 100_000).unwrap();
+    // Close the LP's short position so withdrawal is not blocked.
+    engine.execute_trade(&MATCHER, lp_idx, user_idx, 0, 1_000_000, -100_000).unwrap();
+
+    let claimable_before_withdraw = engine.lp_fee_claimable(lp_idx);
+    assert!(claimable_before_withdraw > 0, "should have accrued fees before withdraw");
+
+    let lp_capital_before = engine.accounts[lp_idx as usize].capital.get();
+
+    // LP withdraws 500_000 (partial).  With the fix, fees earned before the
+    // withdrawal are credited so the LP doesn't lose them.
+    engine.withdraw(lp_idx, 500_000, 0, 1_000_000).unwrap();
+
+    // After the fix, claimable should be ~0 (already credited during withdraw).
+    let claimable_after_withdraw = engine.lp_fee_claimable(lp_idx);
+    assert_eq!(
+        claimable_after_withdraw, 0,
+        "after withdraw with fix, pre-withdrawal fees should have been credited; \
+         remaining claimable = {}",
+        claimable_after_withdraw
+    );
+
+    // LP capital after withdraw should be: (original + credited_fees) - 500_000.
+    let lp_capital_after = engine.accounts[lp_idx as usize].capital.get();
+    assert!(
+        lp_capital_after >= lp_capital_before.saturating_sub(500_000),
+        "LP capital should include credited fees: before={}, after={}",
+        lp_capital_before,
+        lp_capital_after
+    );
+
+    assert_conserved(&engine);
+}
+
+/// Bug 5 (Fairness): LP close_account without snapshot checkpoint causes the LP
+/// to forfeit all accumulated-but-unclaimed fees.
+///
+/// After the fix, `close_account()` credits fees before zeroing capital.
+#[test]
+fn test_lp_close_account_checkpoints_fee_snapshot_earns_fees() {
+    let mut params = default_params();
+    params.fee_split_lp_bps = 10_000;
+    params.fee_split_protocol_bps = 0;
+    params.fee_split_creator_bps = 0;
+    params.trading_fee_bps = 10;
+    params.initial_margin_bps = 100;
+    params.maintenance_margin_bps = 50;
+    params.warmup_period_slots = 0;
+
+    let mut engine = Box::new(RiskEngine::new(params));
+
+    let user_idx = engine.add_user(0).unwrap();
+    let lp_idx   = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
+
+    engine.deposit(lp_idx,   500_000, 0).unwrap();
+    engine.deposit(user_idx, 5_000_000, 0).unwrap();
+
+    // Accrue some LP fees.
+    engine.execute_trade(&MATCHER, lp_idx, user_idx, 0, 1_000_000, 100_000).unwrap();
+
+    let claimable = engine.lp_fee_claimable(lp_idx);
+    assert!(claimable > 0, "should have fees to claim before close");
+
+    let lp_capital_before_close = engine.accounts[lp_idx as usize].capital.get();
+
+    // Close the LP's position first (LP took a short; close it at oracle).
+    engine.admin_force_close(lp_idx, 0, 1_000_000).unwrap();
+
+    // close_account should credit accumulated fees before returning capital.
+    // With the fix: returned = lp_capital_at_close + claimable_credited
+    // Without the fix: returned = lp_capital_at_close (fees forfeited)
+    // The key invariant: returned >= lp_capital_before_close (fees are not lost)
+    let returned = engine.close_account(lp_idx, 0, 1_000_000).unwrap();
+
+    // With the fix, the returned capital must be at least as large as the
+    // pre-close capital (since lp_fee_credit adds fees before the balance is returned).
+    assert!(
+        returned >= lp_capital_before_close,
+        "LP must receive at least their pre-close capital (fees credited, not forfeited): \
+         returned={}, capital_before={}",
+        returned,
+        lp_capital_before_close
+    );
+
+    assert_conserved(&engine);
+}

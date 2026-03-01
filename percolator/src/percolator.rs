@@ -1607,6 +1607,20 @@ impl RiskEngine {
         if capital > self.vault {
             return Err(RiskError::InsufficientBalance);
         }
+
+        // For LP accounts: credit accumulated fees before zeroing capital.
+        // Without this, fees earned since the last snapshot are silently forfeited
+        // when close_account zeroes the LP's capital.
+        if self.accounts[idx as usize].is_lp() {
+            let _ = self.lp_fee_credit(idx);
+        }
+
+        // Re-read capital after the LP fee credit (lp_fee_credit may have added to capital).
+        let capital = self.accounts[idx as usize].capital;
+        // Re-check vault sufficiency after the LP fee credit.
+        if capital > self.vault {
+            return Err(RiskError::InsufficientBalance);
+        }
         self.vault = self.vault - capital;
 
         // Decrement c_tot before freeing slot (free_slot zeroes account but doesn't update c_tot)
@@ -3008,6 +3022,14 @@ impl RiskEngine {
         }
 
         // Vault gets full deposit (tokens received)
+        // For LP accounts: credit accumulated fees at the current capital BEFORE the deposit
+        // increases capital.  Without this checkpoint, an LP who deposits additional capital
+        // can later claim fees for the pre-deposit period at the new (higher) capital level,
+        // draining insurance_fund beyond what was ever deposited for LP fees and violating
+        // the primary conservation invariant vault >= c_tot + insurance.
+        if self.accounts[idx as usize].is_lp() {
+            let _ = self.lp_fee_credit(idx);
+        }
         self.vault = U128::new(add_u128(self.vault.get(), amount));
 
         // Capital gets remainder after fees (via set_capital to maintain c_tot)
@@ -3059,6 +3081,13 @@ impl RiskEngine {
         // This check is after settlement so funding/fees are applied first.
         if !self.accounts[idx as usize].position_size.is_zero() {
             return Err(RiskError::Undercollateralized);
+        }
+
+        // For LP accounts: credit accumulated fees at the current capital BEFORE the withdrawal
+        // reduces capital.  Without this checkpoint, fees earned at the pre-withdrawal capital
+        // level are silently forfeited (they remain in insurance rather than reaching the LP).
+        if self.accounts[idx as usize].is_lp() {
+            let _ = self.lp_fee_credit(idx);
         }
 
         // Read account state (scope the borrow)
