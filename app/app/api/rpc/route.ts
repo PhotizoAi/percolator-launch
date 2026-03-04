@@ -21,18 +21,6 @@ export const dynamic = "force-dynamic";
  */
 
 /**
- * Lazy RPC URL getter — evaluated on first request, not at module load time.
- * Prevents build failures when env vars aren't available during SSG/SSR.
- */
-let _rpcUrl: string | null = null;
-function getRpcUrl(): string {
-  if (!_rpcUrl) {
-    _rpcUrl = getRpcEndpoint();
-  }
-  return _rpcUrl;
-}
-
-/**
  * Allowlist of JSON-RPC methods that may be proxied to Helius.
  * Prevents abuse of the API key for unauthorized operations.
  */
@@ -181,7 +169,7 @@ async function processSingleRequest(req: JsonRpcRequest): Promise<unknown> {
   }
 
   const fetchPromise = (async () => {
-    const response = await fetch(getRpcUrl(), {
+    const response = await fetch(getRpcEndpoint(), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(req),
