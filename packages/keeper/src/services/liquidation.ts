@@ -234,20 +234,10 @@ export class LiquidationService {
               ? price - entryPrice    // long: profit when price goes up
               : entryPrice - price;   // short: profit when price goes down
             
-            // BH5: Overflow protection - check bounds before multiplication
-            const MAX_SAFE_BIGINT = 9007199254740991n; // Number.MAX_SAFE_INTEGER
+            // BH5: BigInt arithmetic in JS is arbitrary-precision and never overflows.
+            // Direct multiplication is always safe; no overflow guard needed.
             const absPosSize = absBI(account.positionSize);
-            
-            // Check if multiplication would overflow
-            if (diff > 0n && absPosSize > MAX_SAFE_BIGINT / diff) {
-              logger.warn("PnL calculation overflow", { accountIndex: i, slabAddress });
-              markPnl = diff > 0n ? MAX_SAFE_BIGINT : -MAX_SAFE_BIGINT;
-            } else if (diff < 0n && absPosSize > MAX_SAFE_BIGINT / -diff) {
-              logger.warn("PnL calculation overflow", { accountIndex: i, slabAddress });
-              markPnl = -MAX_SAFE_BIGINT;
-            } else {
-              markPnl = (diff * absPosSize) / price;
-            }
+            markPnl = (diff * absPosSize) / price;
           }
           const equity = account.capital + markPnl;
 

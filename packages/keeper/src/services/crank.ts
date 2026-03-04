@@ -319,10 +319,6 @@ export class CrankService {
       toCrank.push(slabAddress);
     }
 
-    if (toCrank.length !== this.markets.size - skipped) {
-      logger.warn("Crank mismatch", { totalMarkets: this.markets.size, toCrank: toCrank.length, skipped });
-    }
-
     // PERC-204: Full parallel fan-out — all market cranks are independent transactions,
     // submit them all simultaneously instead of in sequential batches.
     // Each market gets its own transaction with independent nonce/blockhash.
