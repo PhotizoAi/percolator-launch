@@ -114,6 +114,17 @@ export const PositionsTable: FC<{ slabAddress: string }> = ({ slabAddress }) => 
     maintenanceBps,
   );
 
+  // Liq price danger color: amber when mark is within 10% of liq, red within 5%
+  const liqPriceColor = (() => {
+    if (liqPriceE6 <= 0n || !hasValidMark || currentPriceE6 <= 0n) return "text-[var(--warning)]";
+    const markNum = Number(currentPriceE6);
+    const liqNum = Number(liqPriceE6);
+    const distPct = Math.abs(markNum - liqNum) / markNum;
+    if (distPct < 0.05) return "text-[var(--short)]";
+    if (distPct < 0.10) return "text-[var(--warning)]";
+    return "text-[var(--text-secondary)]";
+  })();
+
   const pnlColor =
     pnlTokens === 0n
       ? "text-[var(--text-muted)]"
@@ -183,28 +194,28 @@ export const PositionsTable: FC<{ slabAddress: string }> = ({ slabAddress }) => 
               </td>
 
               {/* Size */}
-              <td className="whitespace-nowrap px-3 py-2.5 text-right" style={{ fontFamily: "var(--font-mono)" }}>
+              <td className="whitespace-nowrap px-3 py-2.5 text-right" style={{ fontFamily: "var(--font-mono)", fontVariantNumeric: "tabular-nums" }}>
                 <span className="text-[var(--text)]">{formatTokenAmount(absPosition, decimals)}</span>
                 <span className="ml-1 text-[var(--text-dim)]">{symbol}</span>
               </td>
 
               {/* Entry */}
-              <td className="whitespace-nowrap px-3 py-2.5 text-right text-[var(--text)]" style={{ fontFamily: "var(--font-mono)" }}>
+              <td className="whitespace-nowrap px-3 py-2.5 text-right text-[var(--text)]" style={{ fontFamily: "var(--font-mono)", fontVariantNumeric: "tabular-nums" }}>
                 {formatUsd(entryPriceE6)}
               </td>
 
               {/* Mark */}
-              <td className="whitespace-nowrap px-3 py-2.5 text-right text-[var(--text)]" style={{ fontFamily: "var(--font-mono)" }}>
+              <td className="whitespace-nowrap px-3 py-2.5 text-right text-[var(--text)]" style={{ fontFamily: "var(--font-mono)", fontVariantNumeric: "tabular-nums" }}>
                 {hasValidMark ? formatUsd(currentPriceE6) : <span className="text-[var(--text-dim)]">--</span>}
               </td>
 
               {/* Liq. Price */}
-              <td className="whitespace-nowrap px-3 py-2.5 text-right text-[var(--warning)]" style={{ fontFamily: "var(--font-mono)" }}>
+              <td className={`whitespace-nowrap px-3 py-2.5 text-right font-medium ${liqPriceColor}`} style={{ fontFamily: "var(--font-mono)", fontVariantNumeric: "tabular-nums" }}>
                 {formatLiqPrice(liqPriceE6)}
               </td>
 
               {/* PnL */}
-              <td className={`whitespace-nowrap px-3 py-2.5 text-right ${hasValidMark ? pnlColor : "text-[var(--text-dim)]"}`} style={{ fontFamily: "var(--font-mono)" }}>
+              <td className={`whitespace-nowrap px-3 py-2.5 text-right ${hasValidMark ? pnlColor : "text-[var(--text-dim)]"}`} style={{ fontFamily: "var(--font-mono)", fontVariantNumeric: "tabular-nums" }}>
                 {hasValidMark ? (
                   <>
                     <div>{formatPnl(pnlTokens, decimals)} {symbol}</div>
@@ -220,7 +231,7 @@ export const PositionsTable: FC<{ slabAddress: string }> = ({ slabAddress }) => 
               </td>
 
               {/* ROE% */}
-              <td className={`whitespace-nowrap px-3 py-2.5 text-right font-medium ${hasValidMark ? roeColor : "text-[var(--text-dim)]"}`} style={{ fontFamily: "var(--font-mono)" }}>
+              <td className={`whitespace-nowrap px-3 py-2.5 text-right font-medium ${hasValidMark ? roeColor : "text-[var(--text-dim)]"}`} style={{ fontFamily: "var(--font-mono)", fontVariantNumeric: "tabular-nums" }}>
                 {hasValidMark ? formatPercent(roe) : "--"}
               </td>
 

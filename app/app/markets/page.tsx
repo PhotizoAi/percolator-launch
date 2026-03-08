@@ -23,6 +23,7 @@ import { useAllMarketStats } from "@/hooks/useAllMarketStats";
 import { MarketLogo } from "@/components/market/MarketLogo";
 import { ErrorBoundary } from "@/components/ui/ErrorBoundary";
 import { detectOracleMode, resolveMarketPriceE6, priceE6ToUsd } from "@/lib/oraclePrice";
+import { formatStatValue } from "@/lib/format";
 
 function formatNum(n: number | null | undefined): string {
   if (n === null || n === undefined) return "\u2014";
@@ -98,15 +99,9 @@ function MarketsPageInner() {
   const { markets: discovered, loading: discoveryLoading } = useMarketDiscovery();
   const { statsMap, loading: statsLoading } = useAllMarketStats();
 
-  // Canonical "active markets" count from Supabase (single source of truth)
-  // Uses shared isActiveMarket filter — consistent with homepage & /api/stats
-  const totalActiveMarkets = useMemo(() => {
-    let count = 0;
-    for (const m of statsMap.values()) {
-      if (isActiveMarket(m)) count++;
-    }
-    return count;
-  }, [statsMap]);
+  // NOTE: totalActiveMarkets (Supabase-only count) removed — was inconsistent with
+  // activeMarkets.length which includes on-chain discovered markets (#847).
+  // Use activeMarkets.length as single source of truth for header + footer counts.
   
   // P-MED-2: Read filters from URL params
   const [search, setSearch] = useState(searchParams.get("q") || "");
@@ -218,8 +213,9 @@ function MarketsPageInner() {
         : (isSaneNum(m.supabase?.total_open_interest ?? 0) ||
            isSaneNum((m.supabase?.open_interest_long ?? 0) + (m.supabase?.open_interest_short ?? 0)));
 
-      // Keep market if it has at least a price (on-chain or Supabase)
-      return hasOnChainPrice || hasSupabasePrice || hasVolume || hasOI;
+      // Keep market if it has data OR if it's marked active in Supabase
+      const isActive = m.supabase ? isActiveMarket(m.supabase) : false;
+      return isActive || hasOnChainPrice || hasSupabasePrice || hasVolume || hasOI;
     });
   }, [effectiveMarkets]);
 
@@ -532,11 +528,11 @@ function MarketsPageInner() {
               </button>
             )}
 
-            {/* Results count — show filtered/total when filters are active */}
+            {/* Results count — use activeMarkets.length as single source of truth (#847) */}
             <span className="ml-auto text-[10px] text-[var(--text-dim)]" style={{ fontFamily: "var(--font-mono)" }}>
-              {(hasSearch || hasActiveFilters) && filtered.length !== totalActiveMarkets
-                ? `${filtered.length} / ${totalActiveMarkets} market${totalActiveMarkets !== 1 ? "s" : ""}`
-                : `${totalActiveMarkets} market${totalActiveMarkets !== 1 ? "s" : ""}`}
+              {(hasSearch || hasActiveFilters) && filtered.length !== activeMarkets.length
+                ? `${filtered.length} / ${activeMarkets.length} market${activeMarkets.length !== 1 ? "s" : ""}`
+                : `${activeMarkets.length} market${activeMarkets.length !== 1 ? "s" : ""}`}
             </span>
           </div>
         </ScrollReveal>
@@ -571,13 +567,13 @@ function MarketsPageInner() {
           ) : (
             <>
               <div className="relative rounded-sm border border-[var(--border)] hud-corners overflow-x-auto">
-                {/* Header row - responsive grid columns */}
-                <div className="grid min-w-[480px] sm:min-w-[700px] grid-cols-[minmax(100px,2fr)_minmax(55px,1fr)_minmax(55px,1fr)_minmax(55px,1fr)_minmax(50px,0.8fr)_minmax(35px,0.5fr)_minmax(40px,0.7fr)] sm:grid-cols-[minmax(140px,2fr)_minmax(70px,1fr)_minmax(70px,1fr)_minmax(70px,1fr)_minmax(70px,1fr)_minmax(50px,0.7fr)_minmax(50px,0.7fr)] gap-2 sm:gap-3 border-b border-[var(--border)] bg-[var(--bg-surface)] px-3 sm:px-4 py-2.5 text-[9px] sm:text-[10px] font-medium uppercase tracking-[0.15em] text-[var(--text-dim)]">
+                {/* Header row: xs=4 cols (name|price|lev|health), sm+=7 cols */}
+                <div className="grid sm:min-w-[700px] grid-cols-[minmax(120px,2fr)_minmax(70px,1fr)_minmax(50px,0.7fr)_minmax(50px,0.7fr)] sm:grid-cols-[minmax(140px,2fr)_minmax(70px,1fr)_minmax(70px,1fr)_minmax(70px,1fr)_minmax(70px,1fr)_minmax(50px,0.7fr)_minmax(50px,0.7fr)] gap-2 sm:gap-3 border-b border-[var(--border)] bg-[var(--bg-surface)] px-3 sm:px-4 py-2.5 text-[9px] sm:text-[10px] font-medium uppercase tracking-[0.15em] text-[var(--text-dim)]">
                   <div>token</div>
                   <div className="text-right">price</div>
-                  <div className="text-right">OI</div>
-                  <div className="text-right">vol</div>
-                  <div className="text-right"><span className="sm:hidden">ins</span><span className="hidden sm:inline">insurance</span></div>
+                  <div className="hidden sm:block text-right">OI</div>
+                  <div className="hidden sm:block text-right">vol</div>
+                  <div className="hidden sm:block text-right">insurance</div>
                   <div className="text-right"><span className="sm:hidden">lev</span><span className="hidden sm:inline">max lev</span></div>
                   <div className="text-right">health</div>
                 </div>
@@ -623,12 +619,13 @@ function MarketsPageInner() {
                     : null;
                   
                   // Display values (USD or tokens) — cap token display at 2dp for table readability
+                  // #865: null → "—", known zero → "$0.00" / "0.00" (never bare "0")
                   const oiDisplay = showUsd && lastPrice != null
                     ? formatNum(Math.round((Number(oiTokensRaw) / tokenDivisor) * lastPrice * 100) / 100)
-                    : formatTokenAmount(oiTokensRaw, mintDecimals, 2);
+                    : formatStatValue(oiTokensRaw, 'number', mintDecimals);
                   const insuranceDisplay = showUsd && lastPrice != null
                     ? formatNum(Math.round((Number(insuranceTokensRaw) / tokenDivisor) * lastPrice * 100) / 100)
-                    : formatTokenAmount(insuranceTokensRaw, mintDecimals, 2);
+                    : formatStatValue(insuranceTokensRaw, 'number', mintDecimals);
                   const volumeDisplay = volume24hRaw != null
                     ? (showUsd && lastPrice != null
                         ? formatNum(Math.round((Number(volume24hRaw) / tokenDivisor) * lastPrice * 100) / 100)
@@ -640,7 +637,7 @@ function MarketsPageInner() {
                       key={m.slabAddress}
                       href={`/trade/${m.slabAddress}`}
                       className={[
-                        "grid min-w-[480px] sm:min-w-[700px] grid-cols-[minmax(100px,2fr)_minmax(55px,1fr)_minmax(55px,1fr)_minmax(55px,1fr)_minmax(50px,0.8fr)_minmax(35px,0.5fr)_minmax(40px,0.7fr)] sm:grid-cols-[minmax(140px,2fr)_minmax(70px,1fr)_minmax(70px,1fr)_minmax(70px,1fr)_minmax(70px,1fr)_minmax(50px,0.7fr)_minmax(50px,0.7fr)] gap-2 sm:gap-3 items-center px-3 sm:px-4 py-3 transition-all duration-200 hover:bg-[var(--accent)]/[0.04] hover:border-l-2 hover:border-l-[var(--accent)]/30",
+                        "grid sm:min-w-[700px] grid-cols-[minmax(120px,2fr)_minmax(70px,1fr)_minmax(50px,0.7fr)_minmax(50px,0.7fr)] sm:grid-cols-[minmax(140px,2fr)_minmax(70px,1fr)_minmax(70px,1fr)_minmax(70px,1fr)_minmax(70px,1fr)_minmax(50px,0.7fr)_minmax(50px,0.7fr)] gap-2 sm:gap-3 items-center px-3 sm:px-4 py-3 transition-all duration-200 hover:bg-[var(--accent)]/[0.04] hover:border-l-2 hover:border-l-[var(--accent)]/30",
                         i > 0 ? "border-t border-[var(--border)]" : "",
                       ].join(" ")}
                     >
@@ -691,18 +688,18 @@ function MarketsPageInner() {
                         </div>
                       </div>
                       <div className="text-right truncate">
-                        <span className="text-sm text-white" style={{ fontFamily: "var(--font-jetbrains-mono)" }}>
+                        <span className="text-sm text-white tabular-nums" style={{ fontFamily: "var(--font-jetbrains-mono)", fontVariantNumeric: "tabular-nums" }}>
                           {lastPrice != null
                             ? `$${lastPrice < 0.01 ? lastPrice.toFixed(6) : lastPrice < 1 ? lastPrice.toFixed(4) : lastPrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
                             : "\u2014"}
                         </span>
                       </div>
-                      <div className="text-right text-sm text-[var(--text-secondary)] truncate" style={{ fontFamily: "var(--font-jetbrains-mono)" }}>{oiDisplay}</div>
-                      <div className="text-right text-sm text-[var(--text-secondary)] truncate" style={{ fontFamily: "var(--font-jetbrains-mono)" }}>
+                      <div className="hidden sm:block text-right text-sm text-[var(--text-secondary)] truncate tabular-nums" style={{ fontFamily: "var(--font-jetbrains-mono)", fontVariantNumeric: "tabular-nums" }}>{oiDisplay}</div>
+                      <div className="hidden sm:block text-right text-sm text-[var(--text-secondary)] truncate tabular-nums" style={{ fontFamily: "var(--font-jetbrains-mono)", fontVariantNumeric: "tabular-nums" }}>
                         {volumeDisplay ?? "\u2014"}
                       </div>
-                      <div className="text-right text-sm text-[var(--text)] truncate" style={{ fontFamily: "var(--font-jetbrains-mono)" }}>{insuranceDisplay}</div>
-                      <div className="text-right text-sm text-[var(--text-secondary)]">{m.maxLeverage}x</div>
+                      <div className="hidden sm:block text-right text-sm text-[var(--text)] truncate tabular-nums" style={{ fontFamily: "var(--font-jetbrains-mono)", fontVariantNumeric: "tabular-nums" }}>{insuranceDisplay}</div>
+                      <div className="text-right text-sm text-[var(--text-secondary)] tabular-nums" style={{ fontVariantNumeric: "tabular-nums" }}>{m.maxLeverage}x</div>
                       <div className="text-right"><HealthBadge level={health.level} /></div>
                     </Link>
                   );
@@ -741,9 +738,24 @@ function MarketsPageInner() {
 export default function MarketsPage() {
   return (
     <Suspense fallback={
-      <div className="min-h-[calc(100vh-48px)] flex flex-col items-center justify-center gap-3">
-        <div className="h-8 w-8 animate-spin rounded-full border-2 border-[var(--accent)] border-t-transparent" />
-        <span className="text-xs text-[var(--text-muted)]">Loading markets…</span>
+      <div className="min-h-[calc(100vh-48px)] relative">
+        <div className="absolute inset-x-0 top-0 h-32 bg-grid pointer-events-none" />
+        <div className="relative mx-auto max-w-4xl px-4 pt-4 pb-10">
+          <div className="mb-8">
+            <ShimmerSkeleton className="h-3 w-20 mb-2" />
+            <ShimmerSkeleton className="h-8 w-48 mb-2" />
+            <ShimmerSkeleton className="h-4 w-72" />
+          </div>
+          <div className="mb-6 flex gap-3">
+            <ShimmerSkeleton className="flex-1 h-11" />
+            <ShimmerSkeleton className="h-11 w-48" />
+          </div>
+          <div className="space-y-2">
+            {[1, 2, 3, 4, 5, 6].map((i) => (
+              <ShimmerSkeleton key={i} className="h-[52px]" />
+            ))}
+          </div>
+        </div>
       </div>
     }>
       <MarketsPageInner />

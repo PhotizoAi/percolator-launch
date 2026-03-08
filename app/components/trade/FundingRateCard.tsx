@@ -8,6 +8,7 @@ import { InfoIcon } from "@/components/ui/Tooltip";
 import { FundingExplainerModal } from "./FundingExplainerModal";
 import { isMockMode } from "@/lib/mock-mode";
 import { isMockSlab } from "@/lib/mock-trade-data";
+import { sanitizeFundingRateBps } from "@/lib/health";
 import { useTokenMeta } from "@/hooks/useTokenMeta";
 
 interface FundingData {
@@ -76,8 +77,8 @@ export const FundingRateCard: FC<{ slabAddress: string }> = ({ slabAddress }) =>
         setError(null);
       } catch {
         // Silently fall back to on-chain data — no error shown to user
-        if (engine && fundingRate !== null) {
-          const rate = Number(fundingRate);
+        if (engine && sanitizeFundingRateBps(fundingRate) !== null) {
+          const rate = Number(sanitizeFundingRateBps(fundingRate)!);
           const hourly = (rate * 9000) / 10000;
           const apr = hourly * 24 * 365;
           const netLp = engine?.netLpPos ?? 0n;
@@ -212,7 +213,7 @@ export const FundingRateCard: FC<{ slabAddress: string }> = ({ slabAddress }) =>
           <div className="flex items-baseline gap-1.5">
             <span
               className={`text-sm font-bold ${hourlyRatePercent >= 0 ? "text-[var(--short)]" : "text-[var(--long)]"}`}
-              style={{ fontFamily: "var(--font-mono)" }}
+              style={{ fontFamily: "var(--font-mono)", fontVariantNumeric: "tabular-nums" }}
             >
               {rateDisplay}
             </span>
@@ -228,7 +229,7 @@ export const FundingRateCard: FC<{ slabAddress: string }> = ({ slabAddress }) =>
               <span className="ml-1.5 text-[9px] text-[var(--text-dim)]">· next {formatCountdown(countdown)}</span>
             )}
           </div>
-          <span className="text-[10px] text-[var(--text-secondary)]" style={{ fontFamily: "var(--font-mono)" }}>
+          <span className="text-[10px] text-[var(--text-secondary)]" style={{ fontFamily: "var(--font-mono)", fontVariantNumeric: "tabular-nums" }}>
             {(fundingData.aprPercent ?? 0) >= 0 ? "+" : ""}{(fundingData.aprPercent ?? 0).toFixed(1)}% APR
           </span>
         </div>
@@ -240,7 +241,7 @@ export const FundingRateCard: FC<{ slabAddress: string }> = ({ slabAddress }) =>
               <span className="text-[9px] uppercase tracking-[0.1em] text-[var(--text-dim)]">
                 Est. 24h ({positionDirection})
               </span>
-              <span className={`text-[11px] font-bold ${fundingColor}`} style={{ fontFamily: "var(--font-mono)" }}>
+              <span className={`text-[11px] font-bold ${fundingColor}`} style={{ fontFamily: "var(--font-mono)", fontVariantNumeric: "tabular-nums" }}>
                 {fundingSign}{estimatedFunding24h.toFixed(4)} tokens
               </span>
             </div>

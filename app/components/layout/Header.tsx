@@ -28,9 +28,11 @@ const buildLinks: NavItem[] = [
   { href: "/developers", label: "Developers" },
   { href: "/guide", label: "Guide" },
   { href: "/devnet-mint", label: "Faucet" },
+  { href: "/stake", label: "Stake" },
 ];
 
 const communityLinks: NavItem[] = [
+  { href: "/leaderboard", label: "Leaderboard" },
   { href: "/join", label: "Join Us" },
   { href: "/agents", label: "Agents" },
   { href: "/report-bug", label: "Report Bug" },
@@ -44,7 +46,7 @@ const mobileGroups = [
 ];
 
 export const Header: FC = () => {
-  const [network, setNet] = useState<Network>("devnet");
+  const [network, setNet] = useState<Network>("mainnet");
   const [mobileOpen, setMobileOpen] = useState(false);
   const [mobileExpanded, setMobileExpanded] = useState<string | null>(null);
   const [scrolled, setScrolled] = useState(false);

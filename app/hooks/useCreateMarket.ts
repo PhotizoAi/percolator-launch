@@ -27,6 +27,9 @@ import {
   encodePushOraclePrice,
   encodeSetOraclePriceCap,
   encodeUpdateConfig,
+  encodeUpdateHyperpMark,
+  detectDexType,
+  parseDexPool,
   ACCOUNTS_INIT_MARKET,
   ACCOUNTS_INIT_LP,
   ACCOUNTS_DEPOSIT_COLLATERAL,
@@ -43,13 +46,53 @@ import {
   derivePythPushOraclePDA,
 } from "@percolator/sdk";
 import { sendTx } from "@/lib/tx";
-import { getConfig } from "@/lib/config";
+import { getConfig, getNetwork } from "@/lib/config";
 import { parseMarketCreationError } from "@/lib/parseMarketError";
 
 import { SLAB_TIERS, slabDataSize, deriveLpPda } from "@percolator/sdk";
 const DEFAULT_SLAB_SIZE = SLAB_TIERS.large.dataSize;
 const ALL_ZEROS_FEED = "0".repeat(64);
 const MATCHER_CTX_SIZE = 320; // Minimum context size for percolator matcher
+
+/**
+ * PERC-465: Fetch the current USD price for a token from Jupiter price API.
+ * Used to push a real initial oracle price immediately after market creation.
+ * Returns null on any failure — caller falls back to params.initialPriceE6.
+ */
+async function fetchJupiterPriceE6(ca: string): Promise<bigint | null> {
+  // 1. Try Jupiter Lite API
+  try {
+    const resp = await fetch(
+      `https://lite.jup.ag/v6/price?ids=${ca}`,
+      { signal: AbortSignal.timeout(5_000) },
+    );
+    if (resp.ok) {
+      const json = await resp.json() as { data?: Record<string, { price?: number }> };
+      const price = json.data?.[ca]?.price;
+      if (price && isFinite(price) && price > 0) {
+        return BigInt(Math.round(price * 1_000_000));
+      }
+    }
+  } catch { /* fall through */ }
+
+  // 2. Fallback: DexScreener (covers Pump.fun + PumpSwap tokens Jupiter misses)
+  try {
+    const resp = await fetch(
+      `https://api.dexscreener.com/latest/dex/tokens/${ca}`,
+      { signal: AbortSignal.timeout(5_000) },
+    );
+    if (resp.ok) {
+      const json = await resp.json() as { pairs?: Array<{ priceUsd?: string }> };
+      const priceStr = json.pairs?.[0]?.priceUsd;
+      const price = priceStr ? parseFloat(priceStr) : 0;
+      if (price > 0 && isFinite(price)) {
+        return BigInt(Math.round(price * 1_000_000));
+      }
+    }
+  } catch { /* fall through */ }
+
+  return null;
+}
 
 /** Minimum vault seed required by percolator-prog before InitMarket (500_000_000 raw tokens). */
 export const MIN_INIT_MARKET_SEED = 500_000_000n;
@@ -84,6 +127,16 @@ export interface CreateMarketParams {
   decimals?: number;
   /** vAMM configuration — if provided, uses custom params instead of defaults */
   vammParams?: VammParams;
+  /** Mainnet token CA — used by oracle keeper to fetch real-time prices (PERC-465) */
+  mainnetCA?: string;
+  /** PERC-470: Oracle mode — determines how price is fed to the market */
+  oracleMode?: "pyth" | "hyperp" | "admin";
+  /** PERC-470: DEX pool address for hyperp mode (PumpSwap/Raydium/Meteora) */
+  dexPoolAddress?: string;
+  /** PERC-470: Base vault address for hyperp mode (PumpSwap) */
+  dexBaseVault?: string;
+  /** PERC-470: Quote vault address for hyperp mode (PumpSwap) */
+  dexQuoteVault?: string;
 }
 
 export interface CreateMarketState {
@@ -93,6 +146,14 @@ export interface CreateMarketState {
   slabAddress: string | null;
   error: string | null;
   loading: boolean;
+  /** Devnet mint address (different from mainnet CA) */
+  devnetMint: string | null;
+  /** Number of tokens airdropped to creator */
+  devnetAirdropAmount: number | null;
+  /** Token symbol for devnet airdrop */
+  devnetAirdropSymbol: string | null;
+  /** Error from devnet mint attempt */
+  devnetMintError: string | null;
 }
 
 const STEP_LABELS = [
@@ -113,6 +174,10 @@ export function useCreateMarket() {
     slabAddress: null,
     error: null,
     loading: false,
+    devnetMint: null,
+    devnetAirdropAmount: null,
+    devnetAirdropSymbol: null,
+    devnetMintError: null,
   });
 
   // Persist slab keypair across retries so we can resume from any step
@@ -143,12 +208,49 @@ export function useCreateMarket() {
       // PERC-277: Default to 4096 (large) — the main devnet program binary is compiled for
       // MAX_ACCOUNTS=4096. Using a smaller tier against a 4096-account program causes
       // InvalidSlabLen (error 0x4) because the program's hardcoded SLAB_LEN won't match.
-      const tierMap: Record<number, string> = { 256: "small", 1024: "medium", 4096: "large" };
-      const tierKey = tierMap[params.maxAccounts ?? 4096] ?? "large";
-      const programsByTier = (cfg as Record<string, unknown>).programsBySlabTier as Record<string, string> | undefined;
-      const selectedProgramId = programsByTier?.[tierKey] ?? cfg.programId;
+      type SlabTier = "small" | "medium" | "large";
+      const tierMap: Record<number, SlabTier> = { 256: "small", 1024: "medium", 4096: "large" };
+      const tierKey: SlabTier = tierMap[params.maxAccounts ?? 4096] ?? "large";
+      const selectedProgramId = cfg.programsBySlabTier?.[tierKey] ?? cfg.programId;
       const programId = new PublicKey(selectedProgramId);
-      const isAdminOracle = params.oracleFeed === ALL_ZEROS_FEED;
+      // PERC-470: Oracle mode detection
+      // - "pyth": index_feed_id = pyth hex, uses KeeperCrank with Pyth PDA
+      // - "hyperp": index_feed_id = zeros, uses UpdateHyperpMark (reads DEX pool directly)
+      // - "admin": index_feed_id = zeros, uses PushOraclePrice + KeeperCrank
+      // PERC-470 devnet guard: Hyperp mode reads live DEX pool accounts on-chain.
+      // On devnet, mirror tokens have no PumpSwap pool — mainnet pool addresses are invalid.
+      // Force admin oracle mode for all devnet mirror markets (params.mainnetCA is set).
+      const isDevnetMirror = !!params.mainnetCA;
+      const resolvedOracleMode = params.oracleMode ?? (params.oracleFeed === ALL_ZEROS_FEED ? "admin" : "pyth");
+      const oracleMode: "pyth" | "hyperp" | "admin" = (resolvedOracleMode === "hyperp" && isDevnetMirror) ? "admin" : resolvedOracleMode;
+      const isAdminOracle = oracleMode === "admin";
+      const isHyperpOracle = oracleMode === "hyperp";
+      // PERC-devnet: isDevnetEnv must be runtime-detected, not build-time.
+      // Users toggle devnet via localStorage — NEXT_PUBLIC_DEFAULT_NETWORK is always "mainnet" on Vercel prod.
+      // Use getNetwork() which reads localStorage("percolator-network") first, then env var, then defaults
+      // to "mainnet" (fail-closed). DO NOT use params.mainnetCA as a devnet proxy — it signals
+      // "this is a devnet mirror market" not "the user is connected to devnet" (issue #835).
+      const isDevnetEnv = getNetwork() === "devnet";
+
+      // PERC-470: Resolve DEX pool vault addresses for hyperp mode
+      // If vaults weren't provided, fetch the pool account on-chain
+      if (isHyperpOracle && params.dexPoolAddress && !params.dexBaseVault) {
+        try {
+          const poolPk = new PublicKey(params.dexPoolAddress);
+          const poolAccount = await connection.getAccountInfo(poolPk);
+          if (poolAccount?.data) {
+            const dexType = detectDexType(poolAccount.owner);
+            if (dexType) {
+              const poolInfo = parseDexPool(dexType, poolPk, poolAccount.data);
+              if (poolInfo.baseVault) params.dexBaseVault = poolInfo.baseVault.toBase58();
+              if (poolInfo.quoteVault) params.dexQuoteVault = poolInfo.quoteVault.toBase58();
+            }
+          }
+        } catch (e) {
+          console.warn("PERC-470: Failed to resolve DEX pool vaults:", e);
+        }
+      }
+
       const startStep = retryFromStep ?? 0;
 
       setState((s) => ({
@@ -226,8 +328,44 @@ export function useCreateMarket() {
                 wallet.publicKey, vaultAta, vaultPda, params.mint,
               );
 
-              // Seed the vault — same fix as fresh creation path
+              // Pre-flight: verify user holds enough tokens for the vault seed transfer.
+              // On devnet, auto-fund via /api/devnet-pre-fund if the user is short.
               const userCollateralAtaRecovery = await getAssociatedTokenAddress(params.mint, wallet.publicKey);
+              let recoveryBalance = 0n;
+              try {
+                const acct = await getAccount(connection, userCollateralAtaRecovery);
+                recoveryBalance = acct.amount;
+              } catch {
+                // Account doesn't exist — balance stays 0
+              }
+              if (recoveryBalance < MIN_INIT_MARKET_SEED) {
+                if (isDevnetEnv) {
+                  setState((s) => ({ ...s, stepLabel: "Funding devnet wallet for vault seed..." }));
+                  const fundResp = await fetch("/api/devnet-pre-fund", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                      mintAddress: params.mint.toBase58(),
+                      walletAddress: wallet.publicKey.toBase58(),
+                    }),
+                  });
+                  if (!fundResp.ok) {
+                    const err = await fundResp.json().catch(() => ({ error: "Unknown error" }));
+                    throw new Error(`Devnet pre-fund failed: ${err.error ?? fundResp.status}`);
+                  }
+                  // Reset label — don't leave UI stuck at "Funding devnet wallet…"
+                  setState((s) => ({ ...s, stepLabel: STEP_LABELS[0] }));
+                } else {
+                  const decimals = params.decimals ?? 6;
+                  const needed = Number(MIN_INIT_MARKET_SEED) / 10 ** decimals;
+                  const have = Number(recoveryBalance) / 10 ** decimals;
+                  throw new Error(
+                    `Insufficient token balance for vault seed. ` +
+                    `You need at least ${needed.toLocaleString()} tokens but your wallet holds ${have.toLocaleString()}. ` +
+                    `Please fund your wallet with the collateral mint before creating a market.`
+                  );
+                }
+              }
               const seedTransferIxRecovery = createTransferInstruction(
                 userCollateralAtaRecovery, vaultAta, wallet.publicKey, MIN_INIT_MARKET_SEED,
               );
@@ -276,9 +414,89 @@ export function useCreateMarket() {
               }));
             }
           } else {
-            // Fresh creation — atomic: createAccount + createATA + InitMarket
+            // Fresh creation — atomic: createAccount + createATA + seed transfer + InitMarket
+
+            // Pre-flight: verify user holds enough tokens for the vault seed transfer.
+            // Without this check the TX fails at the Transfer instruction with an opaque
+            // "invalid account data" error when the user's ATA doesn't exist or is empty.
+            // On devnet, auto-fund via /api/devnet-pre-fund; on mainnet, surface a clear error.
+            const userCollateralAtaCheck = await getAssociatedTokenAddress(params.mint, wallet.publicKey);
+            let userTokenBalance = 0n;
+            try {
+              const acct = await getAccount(connection, userCollateralAtaCheck);
+              userTokenBalance = acct.amount;
+            } catch {
+              // Account doesn't exist — balance stays 0
+            }
+            if (userTokenBalance < MIN_INIT_MARKET_SEED) {
+              if (isDevnetEnv) {
+                // Auto-fund: server mints seed tokens directly to user wallet
+                setState((s) => ({ ...s, stepLabel: "Funding devnet wallet for vault seed..." }));
+                const fundResp = await fetch("/api/devnet-pre-fund", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    mintAddress: params.mint.toBase58(),
+                    walletAddress: wallet.publicKey.toBase58(),
+                  }),
+                });
+                if (!fundResp.ok) {
+                  const err = await fundResp.json().catch(() => ({ error: "Unknown error" }));
+                  throw new Error(`Devnet pre-fund failed: ${err.error ?? fundResp.status}`);
+                }
+                // Re-check label for the actual creation step
+                setState((s) => ({ ...s, stepLabel: STEP_LABELS[0] }));
+              } else {
+                const decimals = params.decimals ?? 6;
+                const needed = Number(MIN_INIT_MARKET_SEED) / 10 ** decimals;
+                const have = Number(userTokenBalance) / 10 ** decimals;
+                throw new Error(
+                  `Insufficient token balance for vault seed. ` +
+                  `You need at least ${needed.toLocaleString()} tokens (${MIN_INIT_MARKET_SEED.toString()} raw) ` +
+                  `but your wallet holds ${have.toLocaleString()}. ` +
+                  `Please fund your wallet with the collateral mint before creating a market.`
+                );
+              }
+            }
+
             const effectiveSlabSize = params.slabDataSize ?? DEFAULT_SLAB_SIZE;
             const slabRent = await connection.getMinimumBalanceForRentExemption(effectiveSlabSize);
+
+            // PERC-509: Pre-check SOL balance before attempting createAccount.
+            // Without this, the tx fails with an opaque "insufficient lamports" error.
+            // We need slabRent + ~0.01 SOL for ATA creation + tx fees.
+            const solBalance = await connection.getBalance(wallet.publicKey);
+            const minSolRequired = slabRent + 10_000_000; // rent + ~0.01 SOL for fees
+            if (solBalance < minSolRequired) {
+              const solNeeded = (minSolRequired / 1e9).toFixed(3);
+              const solHave = (solBalance / 1e9).toFixed(3);
+              if (isDevnetEnv) {
+                // Auto-airdrop SOL on devnet
+                setState((s) => ({ ...s, stepLabel: "Airdropping SOL for slab rent..." }));
+                try {
+                  const airdropSig = await connection.requestAirdrop(
+                    wallet.publicKey,
+                    Math.max(2_000_000_000, minSolRequired - solBalance + 500_000_000),
+                  );
+                  const airdropConfirm = await connection.confirmTransaction(airdropSig, "confirmed");
+                  if (airdropConfirm.value.err) {
+                    throw new Error(`Airdrop transaction failed on-chain: ${JSON.stringify(airdropConfirm.value.err)}`);
+                  }
+                  setState((s) => ({ ...s, stepLabel: STEP_LABELS[0] }));
+                } catch (airdropErr) {
+                  throw new Error(
+                    `Insufficient SOL (have ${solHave}, need ~${solNeeded}). ` +
+                    `Devnet airdrop failed — try again in a few seconds or use the faucet at faucet.solana.com.`
+                  );
+                }
+              } else {
+                throw new Error(
+                  `Insufficient SOL for slab rent. You need ~${solNeeded} SOL but your wallet has ${solHave} SOL. ` +
+                  `The slab account requires ${(slabRent / 1e9).toFixed(3)} SOL in rent-exemption fees.`
+                );
+              }
+            }
+
             const createAccountIx = SystemProgram.createAccount({
               fromPubkey: wallet.publicKey,
               newAccountPubkey: slabKp.publicKey,
@@ -368,9 +586,16 @@ export function useCreateMarket() {
             instructions.push(buildIx({ programId, keys: setAuthToUserKeys, data: setAuthToUserData }));
 
             // 2. PushOraclePrice (user is now authority)
+            // PERC-465: Fetch fresh Jupiter price so we push the real market price,
+            // not the pre-fetched (possibly stale or fallback $1) initialPriceE6.
+            // Use mainnetCA if available (devnet mirror markets), else params.mint.
+            const jupiterCA = params.mainnetCA ?? params.mint.toBase58();
+            const freshPriceE6 = await fetchJupiterPriceE6(jupiterCA);
+            const resolvedPriceE6 = freshPriceE6 ?? params.initialPriceE6;
+
             const now = Math.floor(Date.now() / 1000);
             const pushData = encodePushOraclePrice({
-              priceE6: params.initialPriceE6.toString(),
+              priceE6: resolvedPriceE6.toString(),
               timestamp: now.toString(),
             });
             const pushKeys = buildAccountMetas(ACCOUNTS_PUSH_ORACLE_PRICE, [
@@ -407,13 +632,32 @@ export function useCreateMarket() {
           ]);
           instructions.push(buildIx({ programId, keys: updateConfigKeys, data: updateConfigData }));
 
-          // Pre-LP KeeperCrank (must come BEFORE SetAuth to crank, since SetAuth clears price)
-          const crankData = encodeKeeperCrank({ callerIdx: 65535, allowPanic: false });
-          const oracleAccount = isAdminOracle ? slabPk : derivePythPushOraclePDA(params.oracleFeed)[0];
-          const crankKeys = buildAccountMetas(ACCOUNTS_KEEPER_CRANK, [
-            wallet.publicKey, slabPk, WELL_KNOWN.clock, oracleAccount,
-          ]);
-          instructions.push(buildIx({ programId, keys: crankKeys, data: crankData }));
+          // Pre-LP crank — UpdateHyperpMark for hyperp mode, KeeperCrank otherwise
+          if (isHyperpOracle && params.dexPoolAddress) {
+            // PERC-470: UpdateHyperpMark reads DEX pool directly — no keeper needed
+            const hyperpData = encodeUpdateHyperpMark();
+            const hyperpKeys: { pubkey: PublicKey; isSigner: boolean; isWritable: boolean }[] = [
+              { pubkey: slabPk, isSigner: false, isWritable: true },
+              { pubkey: new PublicKey(params.dexPoolAddress), isSigner: false, isWritable: false },
+              { pubkey: WELL_KNOWN.clock, isSigner: false, isWritable: false },
+            ];
+            // PumpSwap pools need vault0 + vault1 as remaining accounts
+            if (params.dexBaseVault) {
+              hyperpKeys.push({ pubkey: new PublicKey(params.dexBaseVault), isSigner: false, isWritable: false });
+            }
+            if (params.dexQuoteVault) {
+              hyperpKeys.push({ pubkey: new PublicKey(params.dexQuoteVault), isSigner: false, isWritable: false });
+            }
+            instructions.push(new TransactionInstruction({ programId, keys: hyperpKeys, data: Buffer.from(hyperpData) }));
+          } else {
+            // KeeperCrank for Pyth and admin modes
+            const crankData = encodeKeeperCrank({ callerIdx: 65535, allowPanic: false });
+            const oracleAccount = isAdminOracle ? slabPk : derivePythPushOraclePDA(params.oracleFeed)[0];
+            const crankKeys = buildAccountMetas(ACCOUNTS_KEEPER_CRANK, [
+              wallet.publicKey, slabPk, WELL_KNOWN.clock, oracleAccount,
+            ]);
+            instructions.push(buildIx({ programId, keys: crankKeys, data: crankData }));
+          }
 
           // NOTE: Do NOT delegate oracle authority here — SetOracleAuthority clears
           // authority_price_e6 to 0, which would break the final crank in Step 4.
@@ -495,6 +739,46 @@ export function useCreateMarket() {
 
           const userAta = await getAssociatedTokenAddress(params.mint, wallet.publicKey);
 
+          // Pre-flight: verify user has enough tokens for LP deposit + insurance top-up.
+          // Fixes #757/#758 — pre-fund only checked seed amount (500), but TX4 also
+          // needs lpCollateral + insuranceAmount (default 1,000 + 100 = 1,100 more).
+          const tx4Required = params.lpCollateral + params.insuranceAmount;
+          let tx4Balance = 0n;
+          try {
+            const tx4Acct = await getAccount(connection, userAta);
+            tx4Balance = tx4Acct.amount;
+          } catch {
+            // ATA doesn't exist — balance stays 0
+          }
+          if (tx4Balance < tx4Required) {
+            if (isDevnetEnv) {
+              setState((s) => ({ ...s, stepLabel: "Funding devnet wallet for deposit..." }));
+              const fundResp4 = await fetch("/api/devnet-pre-fund", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  mintAddress: params.mint.toBase58(),
+                  walletAddress: wallet.publicKey.toBase58(),
+                }),
+              });
+              if (!fundResp4.ok) {
+                const err4 = await fundResp4.json().catch(() => ({ error: "Unknown error" }));
+                throw new Error(`Devnet pre-fund failed at deposit step: ${err4.error ?? fundResp4.status}`);
+              }
+              setState((s) => ({ ...s, stepLabel: STEP_LABELS[3] }));
+            } else {
+              const decimals = params.decimals ?? 6;
+              const needed = Number(tx4Required) / 10 ** decimals;
+              const have = Number(tx4Balance) / 10 ** decimals;
+              throw new Error(
+                `Insufficient token balance for deposit. ` +
+                `You need ${needed.toLocaleString()} tokens for LP collateral and insurance ` +
+                `but your wallet holds ${have.toLocaleString()}. ` +
+                `Please add tokens to your wallet before continuing.`
+              );
+            }
+          }
+
           const depositData = encodeDepositCollateral({
             userIdx: 0,
             amount: params.lpCollateral.toString(),
@@ -516,9 +800,15 @@ export function useCreateMarket() {
           const finalInstructions = [depositIx, topupIx];
 
           if (isAdminOracle) {
+            // PERC-465: Push fresh price again in the final crank bundle.
+            // Fetch from Jupiter first; fall back to the resolvedPriceE6 from step 1.
+            const jupiterCA2 = params.mainnetCA ?? params.mint.toBase58();
+            const freshPrice2 = await fetchJupiterPriceE6(jupiterCA2);
+            const finalPriceE6 = freshPrice2 ?? params.initialPriceE6;
+
             const now2 = Math.floor(Date.now() / 1000);
             const pushData2 = encodePushOraclePrice({
-              priceE6: params.initialPriceE6.toString(),
+              priceE6: finalPriceE6.toString(),
               timestamp: now2.toString(),
             });
             const pushKeys2 = buildAccountMetas(ACCOUNTS_PUSH_ORACLE_PRICE, [
@@ -527,22 +817,56 @@ export function useCreateMarket() {
             finalInstructions.push(buildIx({ programId, keys: pushKeys2, data: pushData2 }));
           }
 
-          const oracleAccount = isAdminOracle ? slabPk : derivePythPushOraclePDA(params.oracleFeed)[0];
-          const crankData = encodeKeeperCrank({ callerIdx: 65535, allowPanic: false });
-          const crankKeys = buildAccountMetas(ACCOUNTS_KEEPER_CRANK, [
-            wallet.publicKey, slabPk, WELL_KNOWN.clock, oracleAccount,
-          ]);
-          finalInstructions.push(buildIx({ programId, keys: crankKeys, data: crankData }));
+          // PERC-470: Final crank — UpdateHyperpMark for hyperp, KeeperCrank otherwise
+          if (isHyperpOracle && params.dexPoolAddress) {
+            const hyperpData = encodeUpdateHyperpMark();
+            const hyperpKeys: { pubkey: PublicKey; isSigner: boolean; isWritable: boolean }[] = [
+              { pubkey: slabPk, isSigner: false, isWritable: true },
+              { pubkey: new PublicKey(params.dexPoolAddress), isSigner: false, isWritable: false },
+              { pubkey: WELL_KNOWN.clock, isSigner: false, isWritable: false },
+            ];
+            if (params.dexBaseVault) {
+              hyperpKeys.push({ pubkey: new PublicKey(params.dexBaseVault), isSigner: false, isWritable: false });
+            }
+            if (params.dexQuoteVault) {
+              hyperpKeys.push({ pubkey: new PublicKey(params.dexQuoteVault), isSigner: false, isWritable: false });
+            }
+            finalInstructions.push(new TransactionInstruction({ programId, keys: hyperpKeys, data: Buffer.from(hyperpData) }));
+          } else {
+            const oracleAccount = isAdminOracle ? slabPk : derivePythPushOraclePDA(params.oracleFeed)[0];
+            const crankData = encodeKeeperCrank({ callerIdx: 65535, allowPanic: false });
+            const crankKeys = buildAccountMetas(ACCOUNTS_KEEPER_CRANK, [
+              wallet.publicKey, slabPk, WELL_KNOWN.clock, oracleAccount,
+            ]);
+            finalInstructions.push(buildIx({ programId, keys: crankKeys, data: crankData }));
+          }
 
-          // NOTE: For admin oracle markets, user STAYS as oracle authority.
-          // This lets the admin push prices from the My Markets UI.
-          // The crank service handles price push failures gracefully (non-fatal).
-          // Admin can delegate to crank later via "Delegate to Crank" button.
+          // PERC-465: On devnet, delegate oracle authority to the crank keypair so the
+          // oracle keeper can continuously push live prices for this new market.
+          // SetOracleAuthority is added AFTER the final crank — it clears authority_price_e6
+          // but that's fine here since the crank has already processed the current price.
+          // PERC-470: Skip for hyperp mode — oracle_authority stays zeros (permissionless).
+          if (isDevnetEnv && isAdminOracle) {
+            const crankPubkey = getConfig().crankWallet;
+            if (crankPubkey && crankPubkey.trim() !== "") {
+              try {
+                const crankPk = new PublicKey(crankPubkey);
+                const setAuthToCrankData = encodeSetOracleAuthority({ newAuthority: crankPk });
+                const setAuthToCrankKeys = buildAccountMetas(ACCOUNTS_SET_ORACLE_AUTHORITY, [
+                  wallet.publicKey, slabPk,
+                ]);
+                finalInstructions.push(buildIx({ programId, keys: setAuthToCrankKeys, data: setAuthToCrankData }));
+              } catch {
+                // Non-fatal: invalid crankWallet config — market still works, keeper just can't push prices
+                console.warn("PERC-465: Invalid crankWallet config — skipping oracle authority delegation");
+              }
+            }
+          }
 
           const sig = await sendTx({
             connection, wallet,
             instructions: finalInstructions,
-            computeUnits: 400_000,
+            computeUnits: 450_000,
           });
           setState((s) => ({ ...s, txSigs: [...s.txSigs, sig] }));
         }
@@ -588,16 +912,67 @@ export function useCreateMarket() {
               name: params.name ?? "Unknown Token",
               decimals: params.decimals ?? 6,
               deployer: wallet.publicKey.toBase58(),
-              oracle_authority: isAdminOracle ? wallet.publicKey.toBase58() : null,
+              oracle_mode: oracleMode,
+              dex_pool_address: params.dexPoolAddress ?? null,
+              oracle_authority: isAdminOracle
+                ? (isDevnetEnv && getConfig().crankWallet ? getConfig().crankWallet : wallet.publicKey.toBase58())
+                : null,
               initial_price_e6: params.initialPriceE6.toString(),
               max_leverage: params.initialMarginBps > 0 ? Math.floor(10000 / Number(params.initialMarginBps)) : 1,
               trading_fee_bps: Number(params.tradingFeeBps),
               lp_collateral: params.lpCollateral.toString(),
+              mainnet_ca: params.mainnetCA ?? null,
             }),
           });
         } catch {
           // Non-fatal — market is on-chain even if DB write fails
           console.warn("Failed to register market in dashboard DB");
+        }
+
+        // PERC-465: Post-creation hooks — register with oracle keeper + mint devnet token
+        const slabAddr = slabPk.toBase58();
+        const mintAddr = params.mint.toBase58();
+        const isDevnet = getNetwork() === "devnet";
+
+        if (isDevnet && slabAddr) {
+          // PERC-465: mainnet_ca is already written to the markets table via /api/markets POST above.
+          // The oracle keeper auto-discovers new markets from Supabase every 30s.
+
+          // Mint devnet token + airdrop $500 to creator
+          setState((s) => ({ ...s, stepLabel: "Minting devnet tokens..." }));
+          try {
+            const mintResp = await fetch("/api/devnet-mint-token", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                mainnetCA: mintAddr,
+                marketAddress: slabAddr,
+                creatorWallet: wallet.publicKey.toBase58(),
+              }),
+            });
+            const mintData = await mintResp.json();
+            if (mintResp.ok) {
+              setState((s) => ({
+                ...s,
+                devnetMint: mintData.devnetMint ?? null,
+                devnetAirdropAmount: mintData.airdropTokens ?? null,
+                devnetAirdropSymbol: mintData.symbol ?? null,
+              }));
+            } else {
+              console.warn("Devnet mint failed:", mintData.error ?? mintResp.status);
+              // Non-fatal — market is live, just no tokens minted
+              setState((s) => ({
+                ...s,
+                devnetMintError: mintData.error ?? `HTTP ${mintResp.status}`,
+              }));
+            }
+          } catch (mintErr) {
+            console.warn("Devnet mint error:", mintErr);
+            setState((s) => ({
+              ...s,
+              devnetMintError: mintErr instanceof Error ? mintErr.message : "Mint request failed",
+            }));
+          }
         }
 
         // Done! Clear persisted keypair from localStorage
@@ -626,6 +1001,10 @@ export function useCreateMarket() {
       slabAddress: null,
       error: null,
       loading: false,
+      devnetMint: null,
+      devnetAirdropAmount: null,
+      devnetAirdropSymbol: null,
+    devnetMintError: null,
     });
   }, []);
 

@@ -59,6 +59,9 @@ jobs:
       - name: Run unit tests (indexer)
         run: pnpm --filter @percolator/indexer test
 
+      - name: Run unit tests (app)
+        run: pnpm --filter app test
+
       - name: Upload coverage (shared)
         uses: codecov/codecov-action@b9fd7d16f6d7d1b5d2bec1a2887e65ceed900238 # v4
         if: always() && env.HAS_CODECOV_TOKEN == 'true'
@@ -139,6 +142,7 @@ jobs:
       # Privy validates appId.length === 25 exactly; use the secret when available,
       # otherwise fall back to a 25-char placeholder so the server starts in CI.
       NEXT_PUBLIC_PRIVY_APP_ID: ${{ secrets.NEXT_PUBLIC_PRIVY_APP_ID || 'cltestappid00000000000000' }}
+      NEXT_PUBLIC_DEFAULT_NETWORK: devnet
     
     steps:
       - name: Checkout code

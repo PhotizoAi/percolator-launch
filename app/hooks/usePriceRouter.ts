@@ -21,8 +21,8 @@ export interface PriceRouterState {
   error: string | null;
 }
 
-// Use Next.js proxy to avoid CORS — /api/oracle/* is rewritten to the backend
-const API_BASE = "";
+// Use Next.js API route: /api/oracle/resolve/[ca] (Next.js handles proxy/cache)
+const API_BASE = "/api";
 
 /** Maximum number of retry attempts for transient errors */
 const MAX_RETRIES = 2;
@@ -48,7 +48,17 @@ export function usePriceRouter(mintAddress: string | null): PriceRouterState {
   useEffect(() => {
     setState({ bestSource: null, allSources: [], loading: false, error: null });
 
+    // Reject URLs and non-base58 inputs immediately — don't hit the API
     if (!mintAddress || mintAddress.length < 32) return;
+    if (mintAddress.startsWith("http://") || mintAddress.startsWith("https://") || mintAddress.includes("://")) {
+      setState({
+        bestSource: null,
+        allSources: [],
+        loading: false,
+        error: "Paste a valid Solana token address, not a URL",
+      });
+      return;
+    }
 
     abortRef.current?.abort();
     const controller = new AbortController();
@@ -108,10 +118,41 @@ export function usePriceRouter(mintAddress: string | null): PriceRouterState {
 
           const data = await resp.json();
 
+          // PERC-470: Map /api/oracle/resolve response shape to PriceSource
+          // API returns { oracleMode, feedId, dexPoolAddress, dexType, price, source }
+          // NOT { bestSource, allSources } — adapt here.
+          let bestSource: PriceSource | null = null;
+          if (data.oracleMode === "pyth" && data.feedId) {
+            bestSource = {
+              type: "pyth",
+              address: data.feedId,
+              pairLabel: data.symbol ?? null,
+              liquidity: 0,
+              price: data.price ?? 0,
+              confidence: 1,
+            };
+          } else if (data.oracleMode === "hyperp" && data.dexPoolAddress) {
+            bestSource = {
+              type: "dex",
+              address: data.dexPoolAddress,
+              dexId: data.dexType ?? undefined,
+              pairLabel: data.symbol ?? null,
+              liquidity: 0,
+              price: data.price ?? 0,
+              confidence: 0.9,
+            };
+          } else if (data.oracleMode === "admin") {
+            // No oracle found — bestSource stays null, wizard falls to admin mode
+            bestSource = null;
+          } else if (data.bestSource) {
+            // Legacy shape fallback
+            bestSource = data.bestSource;
+          }
+
           if (!controller.signal.aborted) {
             setState({
-              bestSource: data.bestSource || null,
-              allSources: data.allSources || [],
+              bestSource,
+              allSources: data.allSources || (bestSource ? [bestSource] : []),
               loading: false,
               error: null,
             });

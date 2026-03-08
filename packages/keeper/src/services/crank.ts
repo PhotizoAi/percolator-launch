@@ -8,6 +8,11 @@ import {
   derivePythPushOraclePDA,
   ACCOUNTS_KEEPER_CRANK,
   ACCOUNTS_PUSH_ORACLE_PRICE,
+  fetchSlab,
+  parseHeader,
+  parseConfig,
+  parseEngine,
+  parseParams,
   type DiscoveredMarket,
 } from "@percolator/sdk";
 import { config, getConnection, getFallbackConnection, loadKeypair, sendWithRetry, sendWithRetryKeeper, rateLimitedCall, eventBus, createLogger, sendCriticalAlert } from "@percolator/shared";
@@ -27,6 +32,16 @@ interface MarketCrankState {
   missingDiscoveryCount: number;
   /** Permanently skip — market is not initialized on-chain (error 0x4) */
   permanentlySkipped?: boolean;
+  /** Timestamp when the market was first permanently skipped (for cooldown) */
+  permanentlySkippedAt?: number;
+  /** How many times this market has been skipped for 0x4 across rediscoveries */
+  skipCount?: number;
+  /**
+   * PERC-465: Mainnet CA override for price lookups.
+   * On devnet Quick Launch markets, collateralMint is a devnet mirror mint with no DEX data.
+   * This field stores the original mainnet CA so Jupiter/DexScreener lookups use the right address.
+   */
+  mainnetCA?: string;
 }
 
 /** Process items in batches with delay between batches.
@@ -132,11 +147,29 @@ export class CrankService {
         const state = this.markets.get(key)!;
         state.market = market;
         state.missingDiscoveryCount = 0;
-        // Re-enable permanently skipped markets on rediscovery (may have been initialized since)
-        if (state.permanentlySkipped) {
-          state.permanentlySkipped = false;
-          state.consecutiveFailures = 0;
-          logger.info("Re-enabling previously skipped market", { slabAddress: key });
+        // PERC-381: Only re-enable permanently skipped (0x4) markets after a long cooldown
+        // to avoid crank→skip→rediscover→re-enable→crank thrash loop on stale slabs.
+        // Cooldown increases exponentially with skip count (1h, 2h, 4h, ... capped at 24h).
+        if (state.permanentlySkipped && state.permanentlySkippedAt) {
+          const skipCount = state.skipCount ?? 1;
+          const cooldownMs = Math.min(skipCount * 3_600_000, 24 * 3_600_000); // 1h per skip, max 24h
+          const elapsed = Date.now() - state.permanentlySkippedAt;
+          if (elapsed >= cooldownMs) {
+            state.permanentlySkipped = false;
+            state.consecutiveFailures = 0;
+            logger.info("Re-enabling permanently skipped market after cooldown", {
+              slabAddress: key,
+              cooldownMs,
+              skipCount,
+              elapsedMs: elapsed,
+            });
+          } else {
+            logger.debug("Permanently skipped market still in cooldown", {
+              slabAddress: key,
+              remainingMs: cooldownMs - elapsed,
+              skipCount,
+            });
+          }
         }
       }
     }
@@ -186,7 +219,9 @@ export class CrankService {
       // Only push if we are the oracle authority for this market
       if (this.isAdminOracle(market) && keypair.publicKey.equals(market.config.oracleAuthority)) {
         try {
-          const mint = market.config.collateralMint.toBase58();
+          // PERC-465: Use mainnetCA if available (devnet mirror mint markets), else collateralMint.
+          // Fresh devnet mints have no DEX liquidity so Jupiter/DexScreener lookups fail for them.
+          const mint = state.mainnetCA ?? market.config.collateralMint.toBase58();
           const priceEntry = await this.oracleService.fetchPrice(mint, slabAddress);
           if (priceEntry) {
             const pushData = encodePushOraclePrice({
@@ -250,13 +285,18 @@ export class CrankService {
       state.consecutiveFailures++;
 
       // Detect NotInitialized (error 0x4) — permanently skip these markets
+      // PERC-381: Track skip count and timestamp for exponential cooldown on rediscovery
       const errMsg = err instanceof Error ? err.message : String(err);
       if (errMsg.includes("custom program error: 0x4")) {
         state.permanentlySkipped = true;
+        state.permanentlySkippedAt = Date.now();
+        state.skipCount = (state.skipCount ?? 0) + 1;
         state.isActive = false;
-        logger.warn("Market not initialized on-chain, permanently skipping", {
+        logger.warn("Market slab size mismatch (0x4 InvalidSlabLen) — permanently skipping. " +
+          "Fix: run `npx tsx scripts/reinit-slab.ts --slab <ADDRESS>` to recreate with correct size.", {
           slabAddress,
           programId: market.programId.toBase58(),
+          skipCount: state.skipCount,
         });
         return false;
       }
@@ -350,6 +390,78 @@ export class CrankService {
 
     this.lastCycleResult = { success, failed, skipped };
     return { success, failed, skipped };
+  }
+
+  /**
+   * Hot-register a freshly created market without waiting for the next discovery cycle.
+   * Fetches slab data on-chain, adds to the tracked markets map, and triggers an
+   * immediate crank so the price is pushed to the new market within seconds.
+   *
+   * @param slabAddress - The slab account address on-chain
+   * @param mainnetCA   - Optional mainnet CA for price lookups (for devnet mirror mint markets)
+   *
+   * Called by the /register HTTP endpoint when the frontend creates a new market.
+   */
+  async registerMarket(slabAddress: string, mainnetCA?: string): Promise<{ success: boolean; message: string }> {
+    if (this.markets.has(slabAddress)) {
+      // Update mainnetCA even if already tracked (registration may have been partial)
+      if (mainnetCA) {
+        const existing = this.markets.get(slabAddress)!;
+        existing.mainnetCA = mainnetCA;
+      }
+      logger.info("Market already tracked, skipping hot-register", { slabAddress });
+      return { success: true, message: "Market already tracked" };
+    }
+
+    const connection = getConnection();
+    const slabPubkey = new PublicKey(slabAddress);
+
+    let info: Awaited<ReturnType<typeof connection.getAccountInfo>>;
+    try {
+      info = await connection.getAccountInfo(slabPubkey);
+    } catch (err) {
+      const msg = `RPC error fetching slab: ${err instanceof Error ? err.message : String(err)}`;
+      logger.error(msg, { slabAddress });
+      return { success: false, message: msg };
+    }
+
+    if (!info) {
+      return { success: false, message: `Slab account not found: ${slabAddress}` };
+    }
+
+    const data = new Uint8Array(info.data);
+    const programId = info.owner;
+
+    try {
+      const header = parseHeader(data);
+      const marketConfig = parseConfig(data);
+      const engine = parseEngine(data);
+      const params = parseParams(data);
+
+      const market: DiscoveredMarket = { slabAddress: slabPubkey, programId, header, config: marketConfig, engine, params };
+
+      this.markets.set(slabAddress, {
+        market,
+        lastCrankTime: 0,
+        successCount: 0,
+        failureCount: 0,
+        consecutiveFailures: 0,
+        isActive: true,
+        missingDiscoveryCount: 0,
+        mainnetCA,
+      });
+
+      logger.info("Hot-registered new market", { slabAddress, programId: programId.toBase58() });
+
+      // Trigger immediate oracle push + crank so price is live within seconds
+      await this.crankMarket(slabAddress);
+
+      return { success: true, message: "Market registered and initial crank triggered" };
+    } catch (err) {
+      const msg = `Failed to parse slab: ${err instanceof Error ? err.message : String(err)}`;
+      logger.error(msg, { slabAddress });
+      return { success: false, message: msg };
+    }
   }
 
   start(): void {

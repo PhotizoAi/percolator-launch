@@ -16,7 +16,10 @@ export function getNetwork(): Network {
   // Trim env var to handle trailing whitespace/newlines (Vercel env var copy-paste issue)
   const envNet = process.env.NEXT_PUBLIC_DEFAULT_NETWORK?.trim();
   if (envNet === "mainnet" || envNet === "devnet") return envNet;
-  return "devnet";
+  // Default fail-closed to mainnet; prevents devnet-only features (pre-fund, faucet)
+  // from activating on misconfigured production deployments.
+  // Set NEXT_PUBLIC_DEFAULT_NETWORK=devnet explicitly for devnet environments.
+  return "mainnet";
 }
 
 /** Solana public fallback RPC (rate-limited, for development/build only) */
@@ -48,11 +51,15 @@ export function getRpcEndpoint(): string {
   const explicit = validateRpcUrl(process.env.NEXT_PUBLIC_HELIUS_RPC_URL);
   if (explicit) return explicit;
 
-  // 2. Build from Helius API key
-  const apiKey = (process.env.HELIUS_API_KEY ?? "").trim();
+  // 2. Build from Helius API key (PERC-469: prefer network-specific keys, fall back to generic)
+  const net = process.env.NEXT_PUBLIC_DEFAULT_NETWORK?.trim();
+  const network = net === "mainnet" ? "mainnet" : "devnet";
+  const apiKey = (
+    network === "mainnet"
+      ? (process.env.HELIUS_MAINNET_API_KEY ?? process.env.HELIUS_API_KEY ?? "")
+      : (process.env.HELIUS_DEVNET_API_KEY ?? process.env.HELIUS_API_KEY ?? "")
+  ).trim();
   if (apiKey) {
-    const net = process.env.NEXT_PUBLIC_DEFAULT_NETWORK?.trim();
-    const network = net === "mainnet" ? "mainnet" : "devnet";
     return network === "mainnet"
       ? `https://mainnet.helius-rpc.com/?api-key=${apiKey}`
       : `https://devnet.helius-rpc.com/?api-key=${apiKey}`;
@@ -75,7 +82,10 @@ export function getRpcEndpoint(): string {
  * Returns undefined if no Helius key is configured (disables WS subscriptions).
  */
 export function getWsEndpoint(): string | undefined {
-  const apiKey = process.env.NEXT_PUBLIC_HELIUS_WS_API_KEY ?? process.env.NEXT_PUBLIC_HELIUS_API_KEY ?? "";
+  // PERC-469: Use only the dedicated WS key (safe to expose: WS-only, rate-limited).
+  // NEXT_PUBLIC_HELIUS_API_KEY has been removed; HELIUS_API_KEY is server-only and
+  // unavailable on the client, so we cannot use it here.
+  const apiKey = (process.env.NEXT_PUBLIC_HELIUS_WS_API_KEY ?? "").trim();
   if (!apiKey) return undefined;
 
   const net = getNetwork();
@@ -96,7 +106,7 @@ const CONFIGS = {
     get rpcUrl() { return getRpcEndpoint(); },
     programId: "FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD",
     matcherProgramId: "GTRgyTDfrMvBubALAqtHuQwT8tbGyXid7svXZKtWfC9k",
-    crankWallet: "2JaSzRYrf44fPpQBtRJfnCEgThwCmvpFd3FCXi45VXxm",
+    crankWallet: "FF7KFfU5Bb3Mze2AasDHCCZuyhdaSLjUZy2K3JvjdB7x",
     explorerUrl: "https://explorer.solana.com",
     // Multiple program deployments for different slab sizes (PERC-286).
     // Each tier has its own on-chain program compiled with the appropriate --features flag.
@@ -107,7 +117,9 @@ const CONFIGS = {
       small: "FwfBKZXbYr4vTK23bMFkbgKq3npJ3MSDxEaKmq9Aj4Qn",   // 256 slots
       medium: "g9msRSV3sJmmE3r5Twn9HuBsxzuuRGTjKCVTKudm9in",   // 1024 slots
       large: "FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD",    // 4096 slots (confirmed working)
-    } as Record<string, string>,
+    } satisfies Record<string, string>,
+    // PERC-356: Test USDC mint for auto-fund on wallet connect
+    testUsdcMint: process.env.NEXT_PUBLIC_TEST_USDC_MINT ?? "DvH13uxzTzo1xVFwkbJ6YASkZWs6bm3vFDH4xu7kUYTs",
   },
 } as const;
 
@@ -162,6 +174,10 @@ export function getConfig() {
     slabSize: 992_560,
     matcherCtxSize: 320,
     priorityFee: 50_000,
+    // Expose programsBySlabTier with proper typing (devnet has it, mainnet doesn't yet)
+    programsBySlabTier: "programsBySlabTier" in baseConfig
+      ? (baseConfig as typeof CONFIGS.devnet).programsBySlabTier
+      : undefined,
   };
 }
 
@@ -185,7 +201,17 @@ export function setNetwork(network: Network) {
  * Previously: NEXT_PUBLIC_BACKEND_URL, NEXT_PUBLIC_API_URL were used inconsistently.
  */
 export function getBackendUrl(): string {
-  return process.env.NEXT_PUBLIC_API_URL ?? process.env.NEXT_PUBLIC_BACKEND_URL ?? "https://percolator-api-production.up.railway.app";
+  const url = process.env.NEXT_PUBLIC_API_URL ?? process.env.NEXT_PUBLIC_BACKEND_URL;
+  if (!url) {
+    // On non-production, require explicit backend URL to prevent silent proxy to production
+    if (process.env.NODE_ENV !== "production") {
+      throw new Error(
+        "NEXT_PUBLIC_API_URL or NEXT_PUBLIC_BACKEND_URL must be set in non-production environments"
+      );
+    }
+    return "https://percolator-api-production.up.railway.app";
+  }
+  return url;
 }
 
 /** Build an explorer URL for a transaction */

@@ -10,6 +10,7 @@ import { useStakeDeposit } from '@/hooks/useStakeDeposit';
 import { useStakeWithdraw } from '@/hooks/useStakeWithdraw';
 import { useEngineState } from '@/hooks/useEngineState';
 import { useEarnStats, type MarketVaultInfo } from '@/hooks/useEarnStats';
+import { getSupabase } from '@/lib/supabase';
 import { OiCapMeter } from '@/components/earn/OiCapMeter';
 import { ScrollReveal } from '@/components/ui/ScrollReveal';
 import { AnimatedNumber } from '@/components/ui/AnimatedNumber';
@@ -70,6 +71,25 @@ function VaultDetailInner({ slabAddress }: { slabAddress: string }) {
     return earnStats.markets.find((m) => m.slabAddress === slabAddress) ?? null;
   }, [earnStats.markets, slabAddress]);
 
+  // Fallback: fetch symbol directly from Supabase if market not in earn stats
+  // (e.g., market status is not 'active' so it's filtered out of useEarnStats)
+  const [fallbackSymbol, setFallbackSymbol] = useState<string | null>(null);
+  useEffect(() => {
+    if (marketInfo || earnLoading) return;
+    let cancelled = false;
+    getSupabase()
+      .from('markets_with_stats')
+      .select('symbol, name')
+      .eq('slab_address', slabAddress)
+      .maybeSingle()
+      .then(({ data }) => {
+        if (!cancelled && data?.symbol) {
+          setFallbackSymbol(data.symbol);
+        }
+      });
+    return () => { cancelled = true; };
+  }, [marketInfo, earnLoading, slabAddress]);
+
   const loading = poolLoading || earnLoading;
 
   // Callbacks
@@ -89,7 +109,7 @@ function VaultDetailInner({ slabAddress }: { slabAddress: string }) {
     [stakeWithdraw, refreshState],
   );
 
-  const symbol = marketInfo?.symbol ?? 'UNKNOWN';
+  const symbol = marketInfo?.symbol ?? fallbackSymbol ?? 'UNKNOWN';
   const maxOI = marketInfo?.maxOI ?? 0;
   const currentOI = marketInfo?.totalOI ?? (totalOI ? Number(totalOI) / 1e6 : 0);
   const estimatedApy = marketInfo?.estimatedApyPct ?? 0;
@@ -113,6 +133,18 @@ function VaultDetailInner({ slabAddress }: { slabAddress: string }) {
           <span className="text-[var(--text-muted)]">/</span>
           <span className="text-white">{symbol}-PERP Vault</span>
         </div>
+
+        {/* Not Initialized Warning */}
+        {!loading && !poolState.poolExists && (
+          <div className="mb-6 border border-[var(--warning)]/30 bg-[var(--warning)]/5 rounded-sm px-4 py-3">
+            <p className="text-[12px] font-medium text-[var(--warning)]">
+              ⚠ Vault Not Initialized
+            </p>
+            <p className="text-[11px] text-[var(--text-secondary)] mt-1">
+              This market&apos;s LP vault pool has not been created on-chain yet. Deposits and withdrawals are unavailable until the pool is initialized by the market deployer.
+            </p>
+          </div>
+        )}
 
         {/* Header */}
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-8">

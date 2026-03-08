@@ -6,6 +6,61 @@ import { getServiceClient } from "@/lib/supabase";
 import { getConfig } from "@/lib/config";
 import * as Sentry from "@sentry/nextjs";
 
+/**
+ * Maximum valid funding rate in bps/slot (matches on-chain guard).
+ * Raw DB values outside [-MAX, MAX] are garbage from uninitialized slabs.
+ */
+const FUNDING_RATE_BPS_MAX = 10_000;
+
+/** Sanitize a numeric funding_rate from the DB view. Returns null for garbage values. */
+function sanitizeFundingRate(v: number | null | undefined): number | null {
+  if (v == null) return null;
+  if (!Number.isFinite(v) || Math.abs(v) > FUNDING_RATE_BPS_MAX) return null;
+  return v;
+}
+
+/**
+ * Maximum sane mark/last price in USD for API output.
+ * Set at $1M — well above any real crypto price today (BTC ~$100K) but below
+ * the unscaled admin-set test garbage values (e.g. $100M, $900M, $7.9T).
+ * Note: Rust MAX_ORACLE_PRICE is $1B; this is a stricter display-layer guard. (#856)
+ */
+const MAX_SANE_PRICE_USD = 1_000_000; // $1M
+
+/**
+ * Sanitize a price field from the DB (USD float). Returns null for corrupt/garbage values.
+ * Logs a Sentry warning when sanitization fires so we can track data quality. (#882)
+ */
+function sanitizePrice(v: number | null | undefined, field?: string, slabAddress?: string): number | null {
+  if (v == null) return null;
+  if (!Number.isFinite(v) || v <= 0 || v > MAX_SANE_PRICE_USD) {
+    Sentry.captureMessage(`Price sanitization: ${field ?? "price"} = ${v} nulled for slab ${slabAddress ?? "unknown"}`, {
+      level: "warning",
+      tags: { endpoint: "/api/markets", sanitization: "price" },
+    });
+    return null;
+  }
+  return v;
+}
+
+// #868: Blocklist for markets with corrupt state or wrong oracle_authority (e.g. issue #837).
+// Populated from BLOCKED_MARKET_ADDRESSES env var (comma-separated slab addresses).
+// HARDCODED_BLOCKED_MARKETS provides a code-level safety net for known-bad markets
+// so they are excluded even if the env var is not set in a deployment.
+const HARDCODED_BLOCKED_MARKETS: ReadonlySet<string> = new Set([
+  // issue #837: wrong oracle_authority (5Eb8PY personal wallet), hardcoded $1 price,
+  // never timestamped — price manipulation risk on devnet.
+  "HjBePQZnoZVftg9B52gyeuHGjBvt2f8FNCVP4FeoP3YT",
+]);
+
+const BLOCKED_MARKET_ADDRESSES: ReadonlySet<string> = new Set([
+  ...HARDCODED_BLOCKED_MARKETS,
+  ...(process.env.BLOCKED_MARKET_ADDRESSES ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean),
+]);
+
 export const dynamic = "force-dynamic";
 
 // GET /api/markets — list all active markets with stats
@@ -18,7 +73,7 @@ export async function GET() {
         "slab_address,mint_address,symbol,name,decimals,deployer,logo_url,max_leverage,trading_fee_bps," +
         "last_price,mark_price,volume_24h,open_interest_long,open_interest_short,total_open_interest," +
         "insurance_fund,insurance_balance,total_accounts,funding_rate,net_lp_pos,lp_sum_abs,c_tot," +
-        "vault_balance,created_at,stats_updated_at"
+        "vault_balance,created_at,stats_updated_at,oracle_mode,dex_pool_address,mainnet_ca,oracle_authority"
       );
 
     if (error) {
@@ -28,7 +83,42 @@ export async function GET() {
       return NextResponse.json({ error: error.message }, { status: 500 });
     }
 
-    return NextResponse.json({ markets: data }, {
+    // Sanitize funding_rate: raw DB values from uninitialized slabs can be
+    // garbage (e.g. 17733189824741436). Clamp to valid bps range. (#817)
+    // Also: oracle_mode was not populated for markets created before migration 035.
+    // Derive from oracle_authority: zero pubkey → pyth-pinned, else admin/hyperp.
+    // Default to "admin" when unknown — safest assumption for old devnet markets.
+    const ZERO_PUBKEY = "11111111111111111111111111111111";
+    const sanitized = ((data ?? []) as unknown as Record<string, unknown>[])
+      .filter((m) => !BLOCKED_MARKET_ADDRESSES.has(m.slab_address as string))
+      .map((m) => {
+      let oracle_mode = m.oracle_mode as string | null;
+      if (!oracle_mode) {
+        const auth = m.oracle_authority as string | null;
+        if (auth && auth !== ZERO_PUBKEY) {
+          oracle_mode = "admin";
+        } else if (auth === ZERO_PUBKEY) {
+          oracle_mode = "pyth";
+        } else {
+          oracle_mode = "admin"; // safe default
+        }
+      }
+      return {
+        ...m,
+        oracle_mode,
+        funding_rate: sanitizeFundingRate(m.funding_rate as number | null),
+        // #856: Null out corrupt admin-set test prices (raw unscaled u64 values or billions/trillions).
+        // Matches Rust MAX_ORACLE_PRICE = $1B USD ceiling.
+        last_price: sanitizePrice(m.last_price as number | null, "last_price", m.slab_address as string),
+        mark_price: sanitizePrice(m.mark_price as number | null, "mark_price", m.slab_address as string),
+        // #855: Apply same sanitization to index_price — same DB column type and
+        // corruption vector as last_price/mark_price. Inconsistent sanitization
+        // means a corrupt index price still reaches consumers.
+        index_price: sanitizePrice(m.index_price as number | null, "index_price", m.slab_address as string),
+      };
+    });
+
+    return NextResponse.json({ markets: sanitized }, {
       headers: {
         "Cache-Control": "public, s-maxage=10, stale-while-revalidate=30",
       },
@@ -65,6 +155,9 @@ export async function POST(req: NextRequest) {
     lp_collateral,
     matcher_context,
     logo_url,
+    mainnet_ca,
+    oracle_mode,
+    dex_pool_address,
   } = body;
 
   if (!slab_address || !mint_address || !deployer) {
@@ -72,6 +165,29 @@ export async function POST(req: NextRequest) {
       { error: "Missing required fields: slab_address, mint_address, deployer" },
       { status: 400 }
     );
+  }
+
+  // #813: Validate oracle_mode enum
+  const VALID_ORACLE_MODES = ["pyth", "hyperp", "admin"] as const;
+  type OracleMode = typeof VALID_ORACLE_MODES[number];
+  const resolvedOracleMode: OracleMode = oracle_mode ?? "admin";
+  if (!VALID_ORACLE_MODES.includes(resolvedOracleMode)) {
+    return NextResponse.json(
+      { error: `Invalid oracle_mode. Must be one of: ${VALID_ORACLE_MODES.join(", ")}` },
+      { status: 400 }
+    );
+  }
+
+  // #813: Validate dex_pool_address is a valid Solana pubkey (when provided)
+  if (dex_pool_address) {
+    try {
+      new PublicKey(dex_pool_address);
+    } catch {
+      return NextResponse.json(
+        { error: "Invalid dex_pool_address: must be a valid Solana public key" },
+        { status: 400 }
+      );
+    }
   }
 
   // Verify slab account exists on-chain and is owned by our program
@@ -126,6 +242,9 @@ export async function POST(req: NextRequest) {
       lp_collateral,
       matcher_context,
       logo_url: logo_url || null,
+      mainnet_ca: mainnet_ca || null,
+      oracle_mode: resolvedOracleMode,
+      dex_pool_address: dex_pool_address || null,
     })
     .select()
     .single();
@@ -139,6 +258,24 @@ export async function POST(req: NextRequest) {
     slab_address,
     last_price: initial_price_e6 ? initial_price_e6 / 1_000_000 : null,
   });
+
+  // PERC-465: Hot-register with oracle keeper service (server-to-server, non-fatal)
+  if (mainnet_ca && process.env.KEEPER_REGISTER_SECRET) {
+    try {
+      const keeperRegisterUrl = `${process.env.NEXT_PUBLIC_BASE_URL ?? ""}/api/oracle-keeper/register`;
+      await fetch(keeperRegisterUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-keeper-secret": process.env.KEEPER_REGISTER_SECRET,
+        },
+        body: JSON.stringify({ slabAddress: slab_address, mainnetCA: mainnet_ca }),
+        signal: AbortSignal.timeout(5000),
+      }).catch(() => {});
+    } catch {
+      // Non-fatal — oracle keeper will discover via Supabase polling
+    }
+  }
 
     return NextResponse.json({ market }, { status: 201 });
   } catch (error) {

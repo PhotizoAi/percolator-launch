@@ -3,14 +3,21 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { useSlabState } from "@/components/providers/SlabProvider";
 import { resolveMarketPriceE6, sanitizePriceE6 } from "@/lib/oraclePrice";
+import { getBackendUrl } from "@/lib/config";
 
 // Derive WebSocket URL from API URL: https://... → wss://...
 function getWsUrl(): string {
   const explicit = process.env.NEXT_PUBLIC_WS_URL;
   if (explicit) return explicit;
-  const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? process.env.NEXT_PUBLIC_BACKEND_URL ?? "";
-  if (!apiUrl) return "";
-  return apiUrl.replace(/^https:\/\//, "wss://").replace(/^http:\/\//, "ws://");
+  // Use getBackendUrl() which has the Railway production fallback,
+  // instead of reading env vars directly (which returns "" in production
+  // when NEXT_PUBLIC_API_URL is not explicitly set).
+  try {
+    const apiUrl = getBackendUrl();
+    return apiUrl.replace(/^https:\/\//, "wss://").replace(/^http:\/\//, "ws://");
+  } catch {
+    return "";
+  }
 }
 const WS_URL = getWsUrl();
 if (!WS_URL && typeof window !== "undefined") {
@@ -18,6 +25,9 @@ if (!WS_URL && typeof window !== "undefined") {
 }
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 30_000;
+// Jitter: randomise within ±25% of the computed delay to prevent thundering-herd
+// reconnects when the Railway API recovers and hundreds of clients retry in unison.
+const jitter = (ms: number) => ms * (0.75 + Math.random() * 0.5);
 
 interface PriceState {
   price: number | null;
@@ -127,7 +137,7 @@ export function useLivePrice(): PriceState {
             timestamp?: number;
           };
 
-          if (msg.type === "price.updated" && msg.slabAddress === slabAddr && msg.data?.priceE6) {
+          if ((msg.type === "price" || msg.type === "price.updated") && msg.slabAddress === slabAddr && msg.data?.priceE6) {
             // C4: Validate string format before BigInt conversion
             const priceStr = msg.data.priceE6;
             if (typeof priceStr !== "string" || !/^-?\d+$/.test(priceStr)) {
@@ -167,10 +177,11 @@ export function useLivePrice(): PriceState {
 
     function scheduleReconnect() {
       if (!mountedRef.current) return;
+      const delay = jitter(reconnectDelay.current);
       reconnectTimer.current = setTimeout(() => {
         reconnectDelay.current = Math.min(reconnectDelay.current * 2, RECONNECT_MAX_MS);
         connect();
-      }, reconnectDelay.current);
+      }, delay);
     }
 
     connect();

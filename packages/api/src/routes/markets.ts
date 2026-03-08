@@ -8,6 +8,25 @@ import { getConnection, getSupabase, createLogger, sanitizeSlabAddress } from "@
 
 const logger = createLogger("api:markets");
 
+// Markets to exclude from public API responses.
+// Populated from BLOCKED_MARKET_ADDRESSES env var (comma-separated slab addresses).
+// Use this to hide markets with wrong oracle_authority or corrupt state (e.g. issue #837).
+// HARDCODED_BLOCKED_MARKETS provides a code-level safety net for known-bad markets
+// so they are excluded even if the env var is not set in a deployment.
+const HARDCODED_BLOCKED_MARKETS: ReadonlySet<string> = new Set([
+  // issue #837: wrong oracle_authority (5Eb8PY personal wallet), hardcoded $1 price,
+  // never timestamped — price manipulation risk on devnet.
+  "HjBePQZnoZVftg9B52gyeuHGjBvt2f8FNCVP4FeoP3YT",
+]);
+
+const BLOCKED_MARKET_ADDRESSES: ReadonlySet<string> = new Set([
+  ...HARDCODED_BLOCKED_MARKETS,
+  ...(process.env.BLOCKED_MARKET_ADDRESSES ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean),
+]);
+
 export function marketRoutes(): Hono {
   const app = new Hono();
 
@@ -23,7 +42,9 @@ export function marketRoutes(): Hono {
 
         if (error) throw error;
 
-        return (data ?? []).map((m) => ({
+        return (data ?? [])
+          .filter((m) => !BLOCKED_MARKET_ADDRESSES.has(m.slab_address))
+          .map((m) => ({
           slabAddress: m.slab_address,
           mintAddress: m.mint_address,
           symbol: m.symbol,
@@ -44,10 +65,17 @@ export function marketRoutes(): Hono {
           totalOpenInterest: m.total_open_interest ?? null,
           totalAccounts: m.total_accounts ?? null,
           lastCrankSlot: m.last_crank_slot ?? null,
-          lastPrice: m.last_price ?? null,
-          markPrice: m.mark_price ?? null,
-          indexPrice: m.index_price ?? null,
-          fundingRate: m.funding_rate ?? null,
+          lastPrice: (m.last_price != null && Number.isFinite(m.last_price) && m.last_price > 0 && m.last_price <= 1_000_000) ? m.last_price : null,
+          // Fallback chain: mark_price → initial_price_e6 (converted from E6 to USD).
+          // Markets that haven't been cranked yet have null mark_price in the stats view,
+          // but still have a valid initial_price_e6 from market creation.
+          markPrice: (m.mark_price != null && Number.isFinite(m.mark_price) && m.mark_price > 0 && m.mark_price <= 1_000_000)
+            ? m.mark_price
+            : (m.initial_price_e6 != null && m.initial_price_e6 > 0)
+              ? Number(m.initial_price_e6) / 1_000_000
+              : null,
+          indexPrice: (m.index_price != null && Number.isFinite(m.index_price) && m.index_price > 0 && m.index_price <= 1_000_000) ? m.index_price : null,
+          fundingRate: (m.funding_rate != null && Number.isFinite(m.funding_rate) && Math.abs(m.funding_rate) <= 10_000) ? m.funding_rate : null,
           netLpPos: m.net_lp_pos ?? null,
         }));
       },
@@ -92,6 +120,7 @@ export function marketRoutes(): Hono {
   // GET /markets/:slab — single market details (on-chain read) — 10s cache
   app.get("/markets/:slab", cacheMiddleware(10), validateSlab, async (c) => {
     const slab = c.req.param("slab");
+    if (!slab) return c.json({ error: "slab required" }, 400);
     try {
       const connection = getConnection();
       const slabPubkey = new PublicKey(slab);

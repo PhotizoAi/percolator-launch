@@ -35,6 +35,24 @@ vi.mock("next/dynamic", () => ({
 vi.mock("@/hooks/useWalletCompat");
 vi.mock("@/hooks/usePortfolio");
 vi.mock("@/hooks/useMultiTokenMeta");
+vi.mock("@/hooks/useLpPositions", () => ({
+  useLpPositions: () => ({
+    positions: [],
+    totalRedeemable: 0,
+    loading: false,
+    error: null,
+    refresh: vi.fn(),
+  }),
+}));
+vi.mock("@/components/portfolio/LpPositionsPanel", () => ({
+  LpPositionsPanel: () => <div data-testid="lp-positions-panel" />,
+}));
+vi.mock("@/hooks/useTraderStats", () => ({
+  useTraderStats: () => ({ stats: null, loading: false, error: null, refresh: vi.fn() }),
+}));
+vi.mock("@/components/trade/TradeStatsPanel", () => ({
+  TradeStatsPanel: () => <div data-testid="trade-stats-panel" />,
+}));
 vi.mock("@/components/ui/ScrollReveal", () => ({
   ScrollReveal: ({ children }: any) => <div>{children}</div>,
 }));
@@ -363,9 +381,12 @@ describe("Portfolio Component Tests", () => {
 
       render(<PortfolioPage />);
 
-      // Should show loading skeletons
+      // Should show loading skeletons (ShimmerSkeleton uses shimmer-sweep animation,
+      // rendered as a bg-[var(--border)] div with an inner shimmer overlay)
       const skeletons = screen.getAllByRole("generic").filter(
-        (el) => el.className.includes("animate-pulse")
+        (el) =>
+          el.className.includes("animate-pulse") ||
+          el.className.includes("bg-[var(--border)]")
       );
       expect(skeletons.length).toBeGreaterThan(0);
     });

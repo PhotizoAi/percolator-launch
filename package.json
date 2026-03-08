@@ -19,7 +19,15 @@
     "lint": "eslint packages/*/src/**/*.ts",
     "format": "prettier --write packages/*/src/**/*.ts",
     "format:check": "prettier --check packages/*/src/**/*.ts",
-    "start": "pnpm --filter @percolator/app start"
+    "start": "pnpm --filter @percolator/app start",
+    "maker": "tsx scripts/floating-maker.ts",
+    "maker:dry": "DRY_RUN=true tsx scripts/floating-maker.ts",
+    "fleet": "tsx scripts/mm-fleet.ts",
+    "fleet:dry": "DRY_RUN=true tsx scripts/mm-fleet.ts",
+    "fleet:keygen": "tsx scripts/generate-keeper-wallets.ts --airdrop",
+    "fleet:keygen:dry": "tsx scripts/generate-keeper-wallets.ts",
+    "fleet:deploy": "bash scripts/deploy-mm-fleet.sh",
+    "fleet:deploy:dry": "bash scripts/deploy-mm-fleet.sh --dry-run"
   },
   "engines": {
     "node": ">=20"
@@ -46,7 +54,9 @@
       "axios": ">=1.13.5",
       "bn.js": ">=5.2.3",
       "lodash": ">=4.17.21",
-      "minimatch": ">=10.0.0"
+      "minimatch": ">=10.2.3",
+    "rollup": "4.59.0",
+    "serialize-javascript": "7.0.4"
     }
   }
 }

@@ -20,6 +20,7 @@ import { isMockSlab, getMockUserAccount } from "@/lib/mock-trade-data";
 import { WarmupProgress } from "./WarmupProgress";
 import { ClosePositionModal } from "./ClosePositionModal";
 import { sanitizeSymbol } from "@/lib/symbol-utils";
+import { sanitizeFundingRateBps } from "@/lib/health";
 
 function abs(n: bigint): bigint {
   return n < 0n ? -n : n;
@@ -94,6 +95,17 @@ export const PositionPanel: FC<{ slabAddress: string }> = ({ slabAddress }) => {
     maintenanceBps,
   );
 
+  // Liq price danger color: amber when mark is within 10% of liq, red within 5%
+  const liqPriceColor = (() => {
+    if (liqPriceE6 <= 0n || !hasValidMark || currentPriceE6 <= 0n) return "text-[var(--warning)]";
+    const markNum = Number(currentPriceE6);
+    const liqNum = Number(liqPriceE6);
+    const distPct = Math.abs(markNum - liqNum) / markNum;
+    if (distPct < 0.05) return "text-[var(--short)]";   // <5% — critical red
+    if (distPct < 0.10) return "text-[var(--warning)]"; // <10% — amber
+    return "text-[var(--text-secondary)]";               // safe — muted
+  })();
+
   const pnlColor =
     pnlTokens === 0n
       ? "text-[var(--text-muted)]"
@@ -112,8 +124,8 @@ export const PositionPanel: FC<{ slabAddress: string }> = ({ slabAddress }) => {
   // Compute estimated 24h funding from on-chain funding rate
   let estFunding24hDisplay = "—";
   let estFundingColor = "text-[var(--text-muted)]";
-  if (hasPosition && fundingRate != null) {
-    const rateBpsPerSlot = Number(fundingRate);
+  if (hasPosition && sanitizeFundingRateBps(fundingRate) !== null) {
+    const rateBpsPerSlot = Number(sanitizeFundingRateBps(fundingRate)!);
     const slotsPerHour = 9000; // Solana ~400ms per slot
     const hourlyRatePercent = (rateBpsPerSlot * slotsPerHour) / 10000;
     const positionTokens = Number(absPosition) / (10 ** decimals);
@@ -237,7 +249,7 @@ export const PositionPanel: FC<{ slabAddress: string }> = ({ slabAddress }) => {
             </div>
             <div className="flex items-center justify-between py-1.5">
               <span className="text-[10px] uppercase tracking-[0.15em] text-[var(--text-dim)]">Liq. Price</span>
-              <span className="text-[11px] text-[var(--warning)]" style={{ fontFamily: "var(--font-mono)" }}>
+              <span className={`text-[11px] font-medium ${liqPriceColor}`} style={{ fontFamily: "var(--font-mono)" }}>
                 {formatLiqPrice(liqPriceE6)}
               </span>
             </div>

@@ -1,8 +1,11 @@
 "use client";
 
-import { FC, useState } from "react";
+import { FC, useState, useCallback } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { LogoUpload } from "./LogoUpload";
+import { getNetwork } from "@/lib/config";
+import { useWalletCompat } from "@/hooks/useWalletCompat";
 
 interface LaunchSuccessProps {
   tokenSymbol: string;
@@ -12,6 +15,16 @@ interface LaunchSuccessProps {
   marketAddress: string;
   txSigs: string[];
   onDeployAnother: () => void;
+  /** Original mainnet CA the user pasted */
+  mainnetCA?: string;
+  /** Devnet mint address (different from mainnet CA) */
+  devnetMint?: string | null;
+  /** Number of tokens airdropped */
+  devnetAirdropAmount?: number | null;
+  /** Token symbol for airdrop */
+  devnetAirdropSymbol?: string | null;
+  /** Error from devnet mint attempt */
+  devnetMintError?: string | null;
 }
 
 /**
@@ -26,8 +39,46 @@ export const LaunchSuccess: FC<LaunchSuccessProps> = ({
   marketAddress,
   txSigs,
   onDeployAnother,
+  mainnetCA,
+  devnetMint,
+  devnetAirdropAmount,
+  devnetAirdropSymbol,
+  devnetMintError,
 }) => {
   const [copied, setCopied] = useState(false);
+  const [copiedDevnet, setCopiedDevnet] = useState(false);
+  const [mintLoading, setMintLoading] = useState(false);
+  const [mintError, setMintError] = useState<string | null>(null);
+  const isDevnet = getNetwork() === "devnet";
+  const { publicKey } = useWalletCompat();
+  const router = useRouter();
+
+  /** PERC-475: Mint $500 worth of devnet tokens then navigate to the trade page. */
+  const handleMintAndTrade = useCallback(async () => {
+    if (!publicKey || !devnetMint || mintLoading) return;
+    setMintLoading(true);
+    setMintError(null);
+    try {
+      const resp = await fetch("/api/devnet-airdrop", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          mintAddress: devnetMint,
+          walletAddress: publicKey.toBase58(),
+        }),
+      });
+      // On 429 (rate limited) still navigate — wallet may already have tokens
+      if (!resp.ok && resp.status !== 429) {
+        const d = await resp.json();
+        setMintError(d.error ?? "Mint failed — try again");
+        setMintLoading(false);
+        return;
+      }
+    } catch {
+      // Network error — still navigate
+    }
+    router.push(`/trade/${marketAddress}`);
+  }, [publicKey, devnetMint, mintLoading, marketAddress, router]);
 
   const handleCopy = async () => {
     try {
@@ -98,14 +149,110 @@ export const LaunchSuccess: FC<LaunchSuccessProps> = ({
         </div>
       </div>
 
+      {/* Devnet Token Info — CA mismatch notice + airdrop confirmation + mint errors */}
+      {isDevnet && (devnetMint || devnetAirdropAmount || devnetMintError) && (
+        <div className="border border-[var(--accent)]/20 bg-[var(--accent)]/[0.03] p-4 mb-6 text-left w-full max-w-sm mx-auto space-y-3">
+          <p className="text-[9px] font-medium uppercase tracking-[0.15em] text-[var(--accent)]">
+            DEVNET TOKEN INFO
+          </p>
+
+          {devnetAirdropAmount && devnetAirdropSymbol && (
+            <div className="flex items-center gap-2 text-[12px]">
+              <span className="text-[var(--long)]">✓</span>
+              <span className="text-[var(--text)]">
+                Airdropped <strong>{devnetAirdropAmount.toLocaleString(undefined, { maximumFractionDigits: 2 })} {devnetAirdropSymbol}</strong>{" "}
+                <span className="text-[var(--text-dim)]">(~$500 worth)</span>
+              </span>
+            </div>
+          )}
+
+          {devnetMint && (
+            <div className="space-y-1">
+              <p className="text-[10px] text-[var(--text-muted)]">
+                ⚠️ Devnet uses a <strong>different mint address</strong> than mainnet:
+              </p>
+              {mainnetCA && (
+                <div className="flex items-center gap-2 text-[10px]">
+                  <span className="text-[var(--text-dim)] w-16 flex-shrink-0">Mainnet:</span>
+                  <code className="font-mono text-[9px] text-[var(--text-dim)] truncate">{mainnetCA}</code>
+                </div>
+              )}
+              <div className="flex items-center gap-2 text-[10px]">
+                <span className="text-[var(--accent)] w-16 flex-shrink-0 font-medium">Devnet:</span>
+                <code className="font-mono text-[9px] text-[var(--accent)] truncate flex-1">{devnetMint}</code>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    try {
+                      await navigator.clipboard.writeText(devnetMint);
+                      setCopiedDevnet(true);
+                      setTimeout(() => setCopiedDevnet(false), 2000);
+                    } catch {}
+                  }}
+                  className="border border-[var(--border)] px-1.5 py-0.5 text-[8px] font-medium text-[var(--text-muted)] hover:text-[var(--accent)] hover:border-[var(--accent)]/30 transition-colors flex-shrink-0"
+                >
+                  {copiedDevnet ? "✓" : "copy"}
+                </button>
+              </div>
+              <p className="text-[9px] text-[var(--text-dim)] mt-1">
+                Use the devnet mint address when adding tokens to your wallet or trading.
+              </p>
+            </div>
+          )}
+
+          {devnetMintError && (
+            <div className="flex items-center gap-2 text-[11px]">
+              <span className="text-[var(--short)]">✗</span>
+              <span className="text-[var(--short)]">
+                Token mint failed: {devnetMintError}
+              </span>
+            </div>
+          )}
+
+          {!devnetMint && !devnetAirdropAmount && !devnetMintError && (
+            <div className="flex items-center gap-2 text-[11px]">
+              <span className="text-[var(--text-dim)]">⏳</span>
+              <span className="text-[var(--text-dim)]">
+                Devnet token minting in progress...
+              </span>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Devnet mint error — show inline error (minting is automatic, no manual faucet link) */}
+      {isDevnet && devnetMintError && !devnetMint && !devnetAirdropAmount && (
+        <div className="mb-6 text-[11px] text-[var(--text-dim)]">
+          Auto-mint failed ({devnetMintError}). Click &ldquo;Trade This Market&rdquo; and use the airdrop button to get devnet tokens.
+        </div>
+      )}
+
       {/* CTAs */}
       <div className="flex flex-col sm:flex-row items-center justify-center gap-3">
-        <Link
-          href={`/trade/${marketAddress}`}
-          className="w-full sm:w-auto border border-[var(--accent)]/50 bg-[var(--accent)]/[0.08] px-8 py-3 text-[13px] font-bold uppercase tracking-[0.1em] text-[var(--accent)] transition-all hud-btn-corners hover:bg-[var(--accent)]/[0.15]"
-        >
-          TRADE THIS MARKET →
-        </Link>
+        {/* PERC-475: Show "Mint & Trade" on devnet when a mirror mint is available */}
+        {isDevnet && devnetMint && publicKey ? (
+          <button
+            type="button"
+            onClick={handleMintAndTrade}
+            disabled={mintLoading}
+            className="w-full sm:w-auto border border-[var(--long)]/50 bg-[var(--long)]/[0.08] px-8 py-3 text-[13px] font-bold uppercase tracking-[0.1em] text-[var(--long)] transition-all hud-btn-corners hover:bg-[var(--long)]/[0.15] disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {mintLoading ? (
+              <span className="flex items-center gap-2">
+                <span className="animate-spin">⟳</span> MINTING…
+              </span>
+            ) : (
+              "MINT & TRADE →"
+            )}
+          </button>
+        ) : (
+          <Link
+            href={`/trade/${marketAddress}`}
+            className="w-full sm:w-auto border border-[var(--accent)]/50 bg-[var(--accent)]/[0.08] px-8 py-3 text-[13px] font-bold uppercase tracking-[0.1em] text-[var(--accent)] transition-all hud-btn-corners hover:bg-[var(--accent)]/[0.15]"
+          >
+            TRADE THIS MARKET →
+          </Link>
+        )}
         <button
           type="button"
           onClick={onDeployAnother}
@@ -114,6 +261,9 @@ export const LaunchSuccess: FC<LaunchSuccessProps> = ({
           DEPLOY ANOTHER MARKET
         </button>
       </div>
+      {mintError && (
+        <p className="mt-2 text-[11px] text-[var(--short)]">{mintError}</p>
+      )}
 
       {/* Logo upload */}
       <LogoUpload slabAddress={marketAddress} />

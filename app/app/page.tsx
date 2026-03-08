@@ -11,6 +11,7 @@ import { GradientText } from "@/components/ui/GradientText";
 import { ErrorBoundary } from "@/components/ui/ErrorBoundary";
 import { OnboardingIcon } from "@/components/icons/OnboardingIcons";
 import { HeroSection } from "@/components/marketing/HeroSection";
+import { ShimmerSkeleton } from "@/components/ui/ShimmerSkeleton";
 
 /** Format large numbers compactly: 1.2T / 3.4B / 5.6M / 7.8K */
 function formatCompact(n: number): string {
@@ -72,7 +73,7 @@ function HowItWorks() {
                   <div className="flex h-12 w-12 items-center justify-center border border-[var(--accent)]/15 bg-[var(--accent)]/[0.04] transition-colors duration-200 group-hover:border-[var(--accent)]/30 group-hover:bg-[var(--accent)]/[0.08]">
                     <OnboardingIcon type={step.brandIcon} size={32} />
                   </div>
-                  <span className="text-[20px] font-normal tracking-tight text-[var(--text-muted)] transition-colors duration-200 group-hover:text-[var(--accent)]/20" style={{ fontFamily: "var(--font-heading)" }}>
+                  <span className="text-[11px] font-medium tracking-tight text-white/25 transition-colors duration-200 group-hover:text-[var(--accent)]/30" style={{ fontFamily: "var(--font-heading)" }}>
                     {step.number}
                   </span>
                 </div>
@@ -126,7 +127,7 @@ export default function Home() {
       }
 
       try {
-        const { data, error: dbError } = await getSupabase().from("markets_with_stats").select("slab_address, symbol, volume_24h, insurance_balance, last_price, total_open_interest, open_interest_long, open_interest_short, decimals") as { data: { slab_address: string; symbol: string | null; volume_24h: number | null; insurance_balance: number | null; last_price: number | null; total_open_interest: number | null; open_interest_long: number | null; open_interest_short: number | null; decimals: number | null }[] | null; error: { message: string } | null };
+        const { data, error: dbError } = await getSupabase().from("markets_with_stats").select("slab_address, symbol, volume_24h, insurance_balance, insurance_fund, last_price, total_open_interest, open_interest_long, open_interest_short, decimals") as { data: { slab_address: string; symbol: string | null; volume_24h: number | null; insurance_balance: number | null; insurance_fund: number | null; last_price: number | null; total_open_interest: number | null; open_interest_long: number | null; open_interest_short: number | null; decimals: number | null }[] | null; error: { message: string } | null };
         if (dbError) {
           console.error("Failed to query markets_with_stats:", dbError.message);
           throw new Error(dbError.message);
@@ -145,6 +146,15 @@ export default function Home() {
             const usd = (raw / 10 ** d) * p;
             return usd > MAX_PER_MARKET_USD ? 0 : usd; // discard absurd values
           };
+          // For insurance/TVL: when price is missing, fall back to raw token amount
+          // (correct for stablecoins like USDC where 1 token ≈ $1)
+          const toUsdWithFallback = (raw: number, decimals: number | null, price: number | null): number => {
+            if (!isSaneMarketValue(raw)) return 0;
+            const d = Math.min(Math.max(decimals ?? 6, 0), 18);
+            const p = price ?? 0;
+            const usd = p > 0 ? (raw / 10 ** d) * p : raw / 10 ** d;
+            return usd > MAX_PER_MARKET_USD ? 0 : usd;
+          };
 
           // Filter out empty/abandoned markets using shared active-market filter
           // (consistent with /api/stats and markets page)
@@ -152,7 +162,14 @@ export default function Home() {
           setStats({
             markets: activeData.length,
             volume: activeData.reduce((s, m) => s + toUsd(Number(m.volume_24h || 0), m.decimals, m.last_price), 0),
-            insurance: activeData.reduce((s, m) => s + toUsd(Number(m.insurance_balance || 0), m.decimals, m.last_price), 0),
+            insurance: activeData.reduce((s, m) => {
+              // Use insurance_fund (raw on-chain value in token micro-units) consistent with earn page.
+              // Fall back to insurance_balance if insurance_fund is missing.
+              const raw = Number(m.insurance_fund ?? m.insurance_balance ?? 0);
+              if (!isSaneMarketValue(raw)) return s;
+              // Use fallback converter — insurance should show even when price oracle is unavailable
+              return s + toUsdWithFallback(raw, m.decimals, m.last_price);
+            }, 0),
           });
           setStatsLoaded(true);
           // Convert to USD first, then sort by converted volume
@@ -204,16 +221,32 @@ export default function Home() {
             <ScrollReveal stagger={0.08}>
               <div className="grid grid-cols-2 gap-px overflow-hidden border border-[var(--border)] bg-[var(--border)] md:grid-cols-4">
                 {[
-                  { label: "Markets Live", value: statsLoaded ? String(stats.markets) : "—", color: "text-[var(--accent)]" },
-                  { label: "24h Volume", value: statsLoaded ? (stats.volume > 0 ? formatCompact(stats.volume) : "— (devnet)") : "—", color: stats.volume > 0 ? "text-[var(--long)]" : "text-[var(--text-secondary)]" },
-                  { label: "Insurance Fund", value: statsLoaded ? formatCompact(stats.insurance) : "—", color: "text-[var(--accent)]" },
+                  {
+                    label: "Markets Live",
+                    value: statsLoaded ? String(stats.markets) : null,
+                    color: "text-[var(--accent)]",
+                  },
+                  {
+                    label: "24h Volume",
+                    value: statsLoaded ? (stats.volume > 0 ? formatCompact(stats.volume) : "— (devnet)") : null,
+                    color: stats.volume > 0 ? "text-[var(--long)]" : "text-[var(--text-secondary)]",
+                  },
+                  {
+                    label: "Insurance Fund",
+                    value: statsLoaded ? formatCompact(stats.insurance) : null,
+                    color: "text-[var(--accent)]",
+                  },
                   { label: "Access", value: "Open", color: "text-[var(--long)]" },
                 ].map((stat) => (
                   <div key={stat.label} className="bg-[var(--panel-bg)] p-4 sm:p-5 transition-colors duration-200 hover:bg-[var(--bg-elevated)]">
-                    <p className="mb-2 text-[9px] font-medium uppercase tracking-[0.2em] text-[var(--text-secondary)]">{stat.label}</p>
-                    <p className={`text-lg sm:text-xl font-semibold tracking-tight tabular-nums ${stat.color}`} style={{ fontFamily: "var(--font-heading)" }}>
-                      {stat.value}
-                    </p>
+                    <p className="mb-2 text-[10px] font-medium uppercase tracking-[0.2em] text-[#9ca3af]">{stat.label}</p>
+                    {stat.value === null ? (
+                      <ShimmerSkeleton className="h-6 w-14 mt-1" />
+                    ) : (
+                      <p className={`text-lg sm:text-xl font-semibold tracking-tight tabular-nums ${stat.color}`} style={{ fontFamily: "var(--font-heading)" }}>
+                        {stat.value}
+                      </p>
+                    )}
                   </div>
                 ))}
               </div>
@@ -253,7 +286,7 @@ export default function Home() {
                         <path d="M12 21a9.004 9.004 0 0 0 8.716-6.747M12 21a9.004 9.004 0 0 1-8.716-6.747M12 21c2.485 0 4.5-4.03 4.5-9S14.485 3 12 3m0 18c-2.485 0-4.5-4.03-4.5-9S9.515 3 12 3m0 0a8.997 8.997 0 0 1 7.843 4.582M12 3a8.997 8.997 0 0 0-7.843 4.582m15.686 0A11.953 11.953 0 0 1 12 10.5c-2.998 0-5.74-1.1-7.843-2.918m15.686 0A8.959 8.959 0 0 1 21 12c0 .778-.099 1.533-.284 2.253m0 0A17.919 17.919 0 0 1 12 16.5a17.92 17.92 0 0 1-8.716-2.247m0 0A9 9 0 0 1 3 12c0-1.47.353-2.856.978-4.082" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
                       </svg>
                     </div>
-                    <span className="text-[9px] font-medium uppercase tracking-[0.2em] text-[var(--text-secondary)]">
+                    <span className="text-[10px] font-medium uppercase tracking-[0.2em] text-[#9ca3af]">
                       PERMISSIONLESS
                     </span>
                   </div>
@@ -320,7 +353,7 @@ export default function Home() {
                         <path d={f.icon} stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
                       </svg>
                     </div>
-                    <span className="text-[9px] font-medium uppercase tracking-[0.2em] text-[var(--text-secondary)] transition-colors duration-200 group-hover:text-[var(--accent)]/40">
+                    <span className="text-[10px] font-medium uppercase tracking-[0.2em] text-[#9ca3af] transition-colors duration-200 group-hover:text-[var(--accent)]/40">
                       {f.tag}
                     </span>
                   </div>

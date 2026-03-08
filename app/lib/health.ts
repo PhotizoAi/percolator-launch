@@ -32,6 +32,21 @@ export function sanitizeOnChainValue(v: bigint): bigint {
 }
 
 /**
+ * Sanitize a basis-point parameter from on-chain risk params.
+ * Valid BPS values are in [0, maxBps]. Anything above is treated as garbage
+ * (uninitialized on-chain data) and returns null so the UI can show "—".
+ */
+export function sanitizeBps(
+  bps: bigint | number | null | undefined,
+  maxBps: number = 10_000, // 100%
+): number | null {
+  if (bps == null) return null;
+  const n = typeof bps === "bigint" ? Number(bps) : bps;
+  if (n < 0 || n > maxBps || !Number.isFinite(n)) return null;
+  return n;
+}
+
+/**
  * Maximum possible account slots across all slab tiers (large slab = 4096).
  * Any numUsedAccounts value above this is garbage data from an uninitialized slab.
  */
@@ -49,6 +64,23 @@ export function sanitizeAccountCount(count: number, maxAccounts?: number): numbe
   const cap = maxAccounts != null && maxAccounts > 0 ? maxAccounts : MAX_SLAB_ACCOUNTS;
   if (count > cap) return 0;
   return count;
+}
+
+/**
+ * Sanitize a raw on-chain `funding_rate_bps_per_slot_last` (i64) value.
+ *
+ * The Rust program enforces: if abs(rate) > 10_000, it zeroes the field and skips
+ * accrual. Any value outside [-10_000, 10_000] in the account data is therefore
+ * stale/garbage (wrong offset, uninitialized slab, or layout mismatch) and must
+ * be treated as "no data" to avoid rendering astronomically large percentages.
+ *
+ * Returns null when the value is out of range so callers can show "—".
+ */
+export const FUNDING_RATE_BPS_MAX = 10_000n; // matches on-chain guard
+export function sanitizeFundingRateBps(v: bigint | null | undefined): bigint | null {
+  if (v == null) return null;
+  if (v < -FUNDING_RATE_BPS_MAX || v > FUNDING_RATE_BPS_MAX) return null;
+  return v;
 }
 
 /**

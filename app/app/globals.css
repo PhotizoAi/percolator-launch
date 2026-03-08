@@ -40,6 +40,14 @@
 
 html {
   scroll-behavior: smooth;
+  overflow-x: hidden; /* prevent horizontal scroll at viewport level */
+}
+
+/* Account for fixed bottom nav on mobile so anchor-scroll doesn't hide content */
+@media (max-width: 767px) {
+  html {
+    scroll-padding-bottom: 80px;
+  }
 }
 
 @theme {
@@ -59,6 +67,21 @@ body {
   color: var(--text);
   font-family: var(--font-sans);
   font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
+}
+
+/* ─── Tabular Numbers — enforce on all numeric displays ─── */
+[style*="font-family: var(--font-jetbrains-mono)"],
+[style*="font-family:var(--font-jetbrains-mono)"],
+[data-numeric],
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
+}
+
+/* ─── Safe Area — mobile bottom nav ─── */
+.safe-area-bottom {
+  padding-bottom: env(safe-area-inset-bottom, 0px);
 }
 
 /* ─── Noise Texture Overlay ─── */
@@ -855,4 +878,47 @@ input[type="range"]:focus-visible::-webkit-slider-thumb {
 }
 .wallet-adapter-modal-button-close:hover svg {
   fill: var(--accent) !important;
+}
+
+/* ─── Oracle UI Animations ─── */
+@keyframes freshness-ping {
+  0% { transform: scale(1); opacity: 0.4; }
+  75% { transform: scale(2.5); opacity: 0; }
+  100% { transform: scale(1); opacity: 0; }
+}
+
+@keyframes oracle-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(34,211,238,0.4); }
+  50% { box-shadow: 0 0 0 3px rgba(34,211,238,0); }
+}
+
+@keyframes slide-in-right {
+  from { transform: translateX(100%); }
+  to { transform: translateX(0); }
+}
+
+@keyframes slide-out-right {
+  from { transform: translateX(0); }
+  to { transform: translateX(100%); }
+}
+
+@keyframes slide-up {
+  from { transform: translateY(16px); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
+}
+.animate-slide-up { animation: slide-up 0.3s ease-out both; }
+
+@keyframes slide-in-bottom {
+  from { transform: translateY(100%); }
+  to { transform: translateY(0); }
+}
+
+@keyframes slide-out-bottom {
+  from { transform: translateY(0); }
+  to { transform: translateY(100%); }
+}
+
+@keyframes fade-out {
+  from { opacity: 1; }
+  to { opacity: 0; }
 }

@@ -23,11 +23,7 @@ export function HeroCtaGroup() {
     <div ref={ref} className="flex flex-wrap items-center gap-3">
       <Link
         href="/create"
-        className={`hero-cta group relative inline-flex items-center gap-2 rounded-xl bg-purple-600 px-6 py-3 text-sm font-semibold text-white transition-colors hover:bg-purple-500 ${prefersReduced ? '' : 'gsap-fade'}`}
-        style={{
-          boxShadow:
-            "0 0 20px rgba(124,58,237,0.4), 0 0 60px rgba(124,58,237,0.15)",
-        }}
+        className={`hero-cta group relative inline-flex items-center gap-2 bg-violet-700 hover:bg-violet-600 text-white rounded-md px-5 py-2.5 text-sm font-semibold transition-all duration-200 press min-h-[44px] ${prefersReduced ? '' : 'gsap-fade'}`}
       >
         Launch a Market
         <svg
@@ -47,7 +43,7 @@ export function HeroCtaGroup() {
 
       <Link
         href="/markets"
-        className={`hero-cta group inline-flex items-center gap-2 rounded-xl border-[1.5px] border-green-400/30 bg-green-500/15 px-6 py-3 text-[15px] font-semibold text-green-400 transition-all hover:border-green-400/50 hover:bg-green-500/20 ${prefersReduced ? '' : 'gsap-fade'}`}
+        className={`hero-cta group inline-flex items-center gap-2 bg-violet-700 hover:bg-violet-600 text-white rounded-md px-5 py-2.5 text-sm font-semibold transition-all duration-150 min-h-[44px] ${prefersReduced ? '' : 'gsap-fade'}`}
       >
         Trade Now
         <svg
@@ -67,7 +63,7 @@ export function HeroCtaGroup() {
 
       <Link
         href="#how-it-works"
-        className={`hero-cta inline-flex items-center gap-1 text-[14px] font-medium text-[#22d3ee] border-b border-[#22d3ee]/40 pb-px transition-colors hover:text-[#67e8f9] hover:border-[#67e8f9]/70 ${prefersReduced ? '' : 'gsap-fade'}`}
+        className={`hero-cta inline-flex items-center gap-1 text-[14px] font-medium text-[var(--cyan)] border-b border-[var(--cyan)]/40 pb-px transition-colors hover:text-[var(--cyan)] hover:border-[var(--cyan)]/70 ${prefersReduced ? '' : 'gsap-fade'}`}
       >
         Earn as Creator <span aria-hidden="true">→</span>
       </Link>

@@ -33,8 +33,17 @@ const VolDownIcon = () => (
 );
 
 /** Routes where the floating player should be hidden on mobile (<640px)
- *  to avoid overlaying critical interactive UI (e.g. trade margin inputs). */
-const HIDE_ON_MOBILE_ROUTES = ["/trade"];
+ *  to avoid overlaying critical interactive UI (e.g. trade margin inputs,
+ *  stake pool cards that scroll under the player at 370-640px widths). */
+const HIDE_ON_MOBILE_ROUTES = ["/trade", "/stake"];
+
+/**
+ * Routes where the floating player should move to top-right instead of
+ * bottom-right to avoid visually overlapping main content.
+ * e.g. /stake pool cards extend close to the right viewport edge at ~1024–1376px
+ * and the bottom-right player collides with the rightmost pool card.
+ */
+const MOVE_TO_TOP_ROUTES = ["/stake"];
 
 export function MusicPlayer() {
   const [playing, setPlaying] = useState(false);
@@ -49,6 +58,9 @@ export function MusicPlayer() {
 
   /* Determine if the player should be hidden on mobile for this route */
   const hideOnMobile = HIDE_ON_MOBILE_ROUTES.some((r) => pathname?.startsWith(r));
+
+  /* Determine if the player should move to top-right to avoid content overlap */
+  const moveToTop = MOVE_TO_TOP_ROUTES.some((r) => pathname?.startsWith(r));
 
   useEffect(() => {
     if (audioRef.current) audioRef.current.volume = volume;
@@ -110,7 +122,11 @@ export function MusicPlayer() {
   return (
     <div
       ref={containerRef}
-      className={`fixed bottom-3 right-3 z-[90] sm:bottom-5 sm:right-5 gsap-fade${hideOnMobile ? " hidden sm:block" : ""}`}
+      className={`fixed z-[90] gsap-fade${hideOnMobile ? " hidden sm:block" : ""}${
+        moveToTop
+          ? " top-[80px] right-3 sm:top-[72px] sm:right-5"
+          : " bottom-3 right-3 sm:bottom-5 sm:right-5"
+      }`}
       style={{ opacity: 0 }}
     >
       <audio

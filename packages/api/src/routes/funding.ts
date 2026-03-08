@@ -20,6 +20,17 @@ import {
 
 const logger = createLogger("api:funding");
 
+/**
+ * Maximum valid funding rate in bps/slot (matches on-chain guard).
+ * Raw DB values outside [-MAX, MAX] are garbage from uninitialized slabs.
+ * Returns 0 for garbage values to avoid rendering astronomical percentages.
+ */
+const MAX_FUNDING_RATE_BPS = 10_000;
+function sanitizeFundingRateBps(raw: number): number {
+  if (!Number.isFinite(raw) || Math.abs(raw) > MAX_FUNDING_RATE_BPS) return 0;
+  return raw;
+}
+
 export function fundingRoutes(): Hono {
   const app = new Hono();
 
@@ -41,7 +52,7 @@ export function fundingRoutes(): Hono {
       const SLOTS_PER_DAY = 216000;
 
       const markets = (allStats ?? []).map((stats) => {
-        const rateBps = Number(stats.funding_rate ?? 0);
+        const rateBps = sanitizeFundingRateBps(Number(stats.funding_rate ?? 0));
         return {
           slabAddress: stats.slab_address,
           currentRateBpsPerSlot: rateBps,
@@ -85,6 +96,7 @@ export function fundingRoutes(): Hono {
    */
   app.get("/funding/:slab", cacheMiddleware(30), validateSlab, async (c) => {
     const slab = c.req.param("slab");
+    if (!slab) return c.json({ error: "slab required" }, 400);
 
     try {
       // Fetch current funding rate from market_stats
@@ -118,7 +130,7 @@ export function fundingRoutes(): Hono {
       const SLOTS_PER_DAY = 216000;
       const SLOTS_PER_YEAR = 78840000;
 
-      const rateBps = Number(currentRateBpsPerSlot);
+      const rateBps = sanitizeFundingRateBps(Number(currentRateBpsPerSlot));
       const hourlyRatePercent = (rateBps / 10000.0) * SLOTS_PER_HOUR;
       const dailyRatePercent = (rateBps / 10000.0) * SLOTS_PER_DAY;
       const annualizedPercent = (rateBps / 10000.0) * SLOTS_PER_YEAR;
@@ -176,6 +188,7 @@ export function fundingRoutes(): Hono {
    */
   app.get("/funding/:slab/history", validateSlab, async (c) => {
     const slab = c.req.param("slab");
+    if (!slab) return c.json({ error: "slab required" }, 400);
     const limitParam = c.req.query("limit");
     const sinceParam = c.req.query("since");
 

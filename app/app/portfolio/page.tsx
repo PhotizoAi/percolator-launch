@@ -4,14 +4,20 @@ import Link from "next/link";
 import { useEffect } from "react";
 import { useWalletCompat } from "@/hooks/useWalletCompat";
 import { usePortfolio, getLiquidationSeverity } from "@/hooks/usePortfolio";
+import { useLpPositions } from "@/hooks/useLpPositions";
+import { LpPositionsPanel } from "@/components/portfolio/LpPositionsPanel";
 import { formatTokenAmount, formatPriceE6 } from "@/lib/format";
 import dynamic from "next/dynamic";
 import { ScrollReveal } from "@/components/ui/ScrollReveal";
 import { GlowButton } from "@/components/ui/GlowButton";
+import { ShimmerSkeleton } from "@/components/ui/ShimmerSkeleton";
 import { useMultiTokenMeta } from "@/hooks/useMultiTokenMeta";
 import { PublicKey } from "@solana/web3.js";
 import { isMockMode } from "@/lib/mock-mode";
 import { getMockPortfolioPositions } from "@/lib/mock-trade-data";
+import { TradeHistoryTable } from "@/components/trade/TradeHistoryTable";
+import { TradeStatsPanel } from "@/components/trade/TradeStatsPanel";
+import { useTraderStats } from "@/hooks/useTraderStats";
 
 const ConnectButton = dynamic(
   () => import("@/components/wallet/ConnectButton").then((m) => m.ConnectButton),
@@ -32,7 +38,7 @@ function formatPnlPct(pct: number): string {
 
 export default function PortfolioPage() {
   useEffect(() => { document.title = "Portfolio — Percolator"; }, []);
-  const { connected: walletConnected } = useWalletCompat();
+  const { connected: walletConnected, publicKey: walletPublicKey } = useWalletCompat();
   const mockMode = isMockMode();
   const connected = walletConnected || mockMode;
   const portfolio = usePortfolio();
@@ -47,6 +53,12 @@ export default function PortfolioPage() {
   const atRiskCount = portfolio.atRiskCount ?? 0;
   const loading = mockPositions ? false : portfolio.loading;
   const refresh = portfolio.refresh;
+
+  // LP positions (insurance fund deposits)
+  const lpPositions = useLpPositions();
+
+  // PERC-481: Aggregate trade statistics
+  const traderStats = useTraderStats(walletPublicKey?.toBase58() ?? null);
 
   // Auto-refresh every 15s
   useEffect(() => {
@@ -110,11 +122,11 @@ export default function PortfolioPage() {
             </div>
             {refresh && (
               <button
-                onClick={() => refresh()}
-                disabled={loading}
+                onClick={() => { refresh(); lpPositions.refresh(); }}
+                disabled={loading || lpPositions.loading}
                 className="rounded-sm border border-[var(--border)] bg-[var(--panel-bg)] px-4 py-2 text-xs text-[var(--text-secondary)] transition-all hover:border-[var(--accent)]/40 hover:text-[var(--text)] disabled:opacity-40"
               >
-                {loading ? "Refreshing..." : "Refresh"}
+                {loading || lpPositions.loading ? "Refreshing..." : "Refresh"}
               </button>
             )}
           </div>
@@ -122,35 +134,44 @@ export default function PortfolioPage() {
 
         {/* Summary stats */}
         <ScrollReveal stagger={0.08}>
-          <div className="mb-8 grid grid-cols-2 gap-px overflow-hidden border border-[var(--border)] bg-[var(--border)] sm:grid-cols-4">
+          <div className="mb-8 grid grid-cols-2 gap-px overflow-hidden border border-[var(--border)] bg-[var(--border)] sm:grid-cols-5">
+            {/* #863: gate loading shimmer on walletConnected; show "—" (muted) when no wallet */}
             {[
               {
                 label: "Portfolio Value",
-                value: loading ? "\u2026" : formatTokenAmount(totalValue),
-                color: "text-white",
+                value: !walletConnected ? "—" : loading ? "\u2026" : formatTokenAmount(totalValue),
+                color: !walletConnected ? "text-white/40" : "text-white",
               },
               {
                 label: "Total Deposited",
-                value: loading ? "\u2026" : formatTokenAmount(totalDeposited),
-                color: "text-[var(--text-secondary)]",
+                value: !walletConnected ? "—" : loading ? "\u2026" : formatTokenAmount(totalDeposited),
+                color: !walletConnected ? "text-white/40" : "text-[var(--text-secondary)]",
               },
               {
                 label: "Unrealized PnL",
-                value: loading ? "\u2026" : formatPnl(totalUnrealizedPnl),
-                color: totalUnrealizedPnl >= 0n ? "text-[var(--long)]" : "text-[var(--short)]",
-                sub: loading ? undefined : `${totalDeposited > 0n ? formatPnlPct(Number((totalUnrealizedPnl * 10000n) / (totalDeposited || 1n)) / 100) : "0.00%"}`,
+                value: !walletConnected ? "—" : loading ? "\u2026" : formatPnl(totalUnrealizedPnl),
+                color: !walletConnected ? "text-white/40" : totalUnrealizedPnl >= 0n ? "text-[var(--long)]" : "text-[var(--short)]",
+                sub: !walletConnected || loading ? undefined : `${totalDeposited > 0n ? formatPnlPct(Number((totalUnrealizedPnl * 10000n) / (totalDeposited || 1n)) / 100) : "0.00%"}`,
+              },
+              {
+                label: "LP Value",
+                value: !walletConnected ? "—" : lpPositions.loading ? "\u2026" : `$${lpPositions.totalRedeemable.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
+                color: !walletConnected ? "text-white/40" : lpPositions.totalRedeemable > 0 ? "text-[var(--cyan)]" : "text-[var(--text-dim)]",
+                sub: walletConnected && lpPositions.positions.length > 0
+                  ? `${lpPositions.positions.length} pool${lpPositions.positions.length > 1 ? "s" : ""}`
+                  : undefined,
               },
               {
                 label: "Positions",
-                value: loading ? "\u2026" : positions.length.toString(),
-                color: "text-white",
-                sub: atRiskCount > 0 ? `${atRiskCount} at risk` : undefined,
+                value: !walletConnected ? "—" : loading ? "\u2026" : positions.length.toString(),
+                color: !walletConnected ? "text-white/40" : "text-white",
+                sub: walletConnected && atRiskCount > 0 ? `${atRiskCount} at risk` : undefined,
                 subColor: atRiskCount > 0 ? "text-[var(--short)]" : undefined,
               },
-            ].map((stat) => (
-              <div key={stat.label} className="bg-[var(--panel-bg)] p-5 transition-colors duration-200 hover:bg-[var(--bg-elevated)]">
+            ].map((stat, idx, arr) => (
+              <div key={stat.label} className={`bg-[var(--panel-bg)] p-5 transition-colors duration-200 hover:bg-[var(--bg-elevated)]${idx === arr.length - 1 && arr.length % 2 !== 0 ? " col-span-2 sm:col-span-1" : ""}`}>
                 <p className="mb-2 text-[9px] font-medium uppercase tracking-[0.2em] text-[var(--text-dim)]">{stat.label}</p>
-                <p className={`text-xl font-bold ${stat.color}`} style={{ fontFamily: "var(--font-jetbrains-mono)" }}>
+                <p className={`text-xl font-bold tabular-nums ${stat.color}`} style={{ fontFamily: "var(--font-jetbrains-mono)", fontVariantNumeric: "tabular-nums" }}>
                   {stat.value}
                 </p>
                 {stat.sub && (
@@ -165,10 +186,31 @@ export default function PortfolioPage() {
 
         {/* Positions */}
         <ScrollReveal delay={0.2}>
-          {loading || tokenMetasLoading ? (
-            <div className="space-y-px">
+          {/* #863: only show shimmer when wallet is actually connected (prevents infinite skeleton when unauthenticated) */}
+          {(loading || tokenMetasLoading) && walletConnected ? (
+            <div className="space-y-3">
               {[1, 2, 3].map((i) => (
-                <div key={i} className="h-14 animate-pulse bg-[var(--panel-bg)] border border-[var(--border)]" />
+                <div key={i} className="border border-[var(--border)] bg-[var(--panel-bg)] p-4">
+                  <div className="flex items-center justify-between mb-3">
+                    <div className="flex items-center gap-3">
+                      <ShimmerSkeleton className="h-5 w-28" />
+                      <ShimmerSkeleton className="h-5 w-14 rounded" />
+                      <ShimmerSkeleton className="h-5 w-10 rounded" />
+                    </div>
+                    <div className="text-right flex items-center gap-2">
+                      <ShimmerSkeleton className="h-5 w-20" />
+                      <ShimmerSkeleton className="h-4 w-14" />
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-2 gap-x-6 gap-y-1.5 sm:grid-cols-5">
+                    {[1, 2, 3, 4, 5].map((j) => (
+                      <div key={j}>
+                        <ShimmerSkeleton className="h-3 w-12 mb-1.5" />
+                        <ShimmerSkeleton className="h-4 w-16" />
+                      </div>
+                    ))}
+                  </div>
+                </div>
               ))}
             </div>
           ) : positions.length === 0 ? (
@@ -231,7 +273,7 @@ export default function PortfolioPage() {
                       {/* Row 1: Market name, side, PnL */}
                       <div className="flex items-center justify-between gap-4">
                         <div className="flex items-center gap-3">
-                          <span className="text-sm font-semibold text-white" style={{ fontFamily: "var(--font-jetbrains-mono)" }}>
+                          <span className="text-sm font-semibold text-white" style={{ fontFamily: "var(--font-jetbrains-mono)", fontVariantNumeric: "tabular-nums" }}>
                             {tokenMetaMap.get(pos.market.config.collateralMint.toBase58())?.symbol ?? pos.slabAddress.slice(0, 8) + "\u2026"}/USD
                           </span>
                           <span className={`rounded px-2 py-0.5 text-[10px] font-bold ${
@@ -252,7 +294,7 @@ export default function PortfolioPage() {
                         <div className="text-right">
                           <span
                             className={`text-sm font-bold ${pnlPositive ? "text-[var(--long)]" : "text-[var(--short)]"}`}
-                            style={{ fontFamily: "var(--font-jetbrains-mono)" }}
+                            style={{ fontFamily: "var(--font-jetbrains-mono)", fontVariantNumeric: "tabular-nums" }}
                           >
                             {formatPnl(unrealizedPnl)}
                           </span>
@@ -268,25 +310,25 @@ export default function PortfolioPage() {
                       <div className="mt-3 grid grid-cols-2 gap-x-6 gap-y-1.5 sm:grid-cols-5">
                         <div>
                           <p className="text-[9px] font-medium uppercase tracking-[0.15em] text-[var(--text-dim)]">Size</p>
-                          <p className="text-[12px] text-white" style={{ fontFamily: "var(--font-jetbrains-mono)" }}>
+                          <p className="text-[12px] text-white" style={{ fontFamily: "var(--font-jetbrains-mono)", fontVariantNumeric: "tabular-nums" }}>
                             {formatTokenAmount(sizeAbs)}
                           </p>
                         </div>
                         <div>
                           <p className="text-[9px] font-medium uppercase tracking-[0.15em] text-[var(--text-dim)]">Entry</p>
-                          <p className="text-[12px] text-[var(--text-secondary)]" style={{ fontFamily: "var(--font-jetbrains-mono)" }}>
+                          <p className="text-[12px] text-[var(--text-secondary)]" style={{ fontFamily: "var(--font-jetbrains-mono)", fontVariantNumeric: "tabular-nums" }}>
                             {formatPriceE6(posEntry)}
                           </p>
                         </div>
                         <div>
                           <p className="text-[9px] font-medium uppercase tracking-[0.15em] text-[var(--text-dim)]">Mark Price</p>
-                          <p className="text-[12px] text-[var(--text-secondary)]" style={{ fontFamily: "var(--font-jetbrains-mono)" }}>
+                          <p className="text-[12px] text-[var(--text-secondary)]" style={{ fontFamily: "var(--font-jetbrains-mono)", fontVariantNumeric: "tabular-nums" }}>
                             {oraclePriceE6 > 0n ? formatPriceE6(oraclePriceE6) : "—"}
                           </p>
                         </div>
                         <div>
                           <p className="text-[9px] font-medium uppercase tracking-[0.15em] text-[var(--text-dim)]">Capital</p>
-                          <p className="text-[12px] text-[var(--text-secondary)]" style={{ fontFamily: "var(--font-jetbrains-mono)" }}>
+                          <p className="text-[12px] text-[var(--text-secondary)]" style={{ fontFamily: "var(--font-jetbrains-mono)", fontVariantNumeric: "tabular-nums" }}>
                             {formatTokenAmount(posCapital)}
                           </p>
                         </div>
@@ -313,7 +355,7 @@ export default function PortfolioPage() {
                                   ? "text-[var(--warning)]"
                                   : "text-[var(--text-secondary)]"
                               }`}
-                              style={{ fontFamily: "var(--font-jetbrains-mono)" }}
+                              style={{ fontFamily: "var(--font-jetbrains-mono)", fontVariantNumeric: "tabular-nums" }}
                             >
                               {hasPosition && liquidationPriceE6 > 0n
                                 ? formatPriceE6(liquidationPriceE6)
@@ -362,24 +404,42 @@ export default function PortfolioPage() {
           )}
         </ScrollReveal>
 
-        {/* Position history placeholder */}
-        {positions.length > 0 && (
-          <ScrollReveal delay={0.3}>
-            <div className="mt-8">
-              <h2 className="mb-3 text-[10px] font-medium uppercase tracking-[0.25em] text-[var(--accent)]/60">
-                // trade history
-              </h2>
-              <div className="border border-dashed border-[var(--border)] bg-[var(--panel-bg)]/50 p-8 text-center">
-                <p className="text-[13px] text-[var(--text-dim)]">
-                  Position history and closed trades coming soon
-                </p>
-                <p className="mt-1 text-[10px] text-[var(--text-dim)]/60">
-                  Requires indexer integration for historical trade data
-                </p>
+        {/* LP positions */}
+        <ScrollReveal delay={0.25}>
+          <div className="mt-8">
+            <LpPositionsPanel
+              loading={lpPositions.loading}
+              positions={lpPositions.positions}
+              totalRedeemable={lpPositions.totalRedeemable}
+              error={lpPositions.error}
+              onRetry={lpPositions.refresh}
+            />
+          </div>
+        </ScrollReveal>
+
+        {/* Trade history + stats */}
+        <ScrollReveal delay={0.3}>
+          <div className="mt-8">
+            <h2 className="mb-3 text-[10px] font-medium uppercase tracking-[0.25em] text-[var(--accent)]/60">
+              // trade history
+            </h2>
+            {/* PERC-481: Aggregate stats banner */}
+            {(traderStats.stats || traderStats.loading) && (
+              <div className="mb-2">
+                <TradeStatsPanel
+                  stats={traderStats.stats}
+                  loading={traderStats.loading}
+                  error={traderStats.error}
+                  onRetry={traderStats.refresh}
+                />
               </div>
-            </div>
-          </ScrollReveal>
-        )}
+            )}
+            <TradeHistoryTable
+              wallet={walletPublicKey?.toBase58() ?? null}
+              pageSize={20}
+            />
+          </div>
+        </ScrollReveal>
       </div>
     </div>
   );

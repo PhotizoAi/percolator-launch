@@ -27,6 +27,29 @@ vi.mock("@/hooks/useStuckSlabs", () => ({
   }),
 }));
 
+// Mock useCloseMarket — keeps wallet/connection dependencies out of unit tests.
+let mockCloseSlab = vi.fn().mockResolvedValue(null);
+let mockCloseLoading = false;
+let mockCloseError: string | null = null;
+
+vi.mock("@/hooks/useCloseMarket", () => ({
+  useCloseMarket: () => ({
+    closeSlab: mockCloseSlab,
+    loading: mockCloseLoading,
+    error: mockCloseError,
+  }),
+}));
+
+const mockReclaim = vi.fn();
+vi.mock("@/hooks/useReclaimSlabRent", () => ({
+  useReclaimSlabRent: () => ({
+    status: "idle",
+    error: null,
+    txSig: null,
+    reclaim: mockReclaim,
+  }),
+}));
+
 // ─── Helpers ───
 
 function makeStuckSlab(overrides: Partial<typeof mockStuckSlab & object> = {}) {
@@ -48,6 +71,9 @@ describe("RecoverSolBanner", () => {
   beforeEach(() => {
     mockStuckSlab = null;
     mockLoading = false;
+    mockCloseLoading = false;
+    mockCloseError = null;
+    mockCloseSlab = vi.fn().mockResolvedValue(null);
     vi.clearAllMocks();
   });
 
@@ -84,19 +110,38 @@ describe("RecoverSolBanner", () => {
     mockStuckSlab = makeStuckSlab({ isInitialized: false, exists: true });
     const onResume = vi.fn();
     render(<RecoverSolBanner onResume={onResume} />);
-    expect(screen.getByText(/Stuck Slab Account Detected/i)).toBeDefined();
+    // PERC-511: banner text updated to reflect recoverability
+    expect(screen.getByText(/Stuck Slab — SOL Recoverable/i)).toBeDefined();
+    expect(screen.getByRole("button", { name: /RECLAIM/i })).toBeDefined();
     expect(screen.getByRole("button", { name: /RETRY INITIALIZATION/i })).toBeDefined();
     expect(screen.getByText(/VIEW ON EXPLORER/i)).toBeDefined();
   });
 
-  it("calls onResume with slab address when resume clicked", () => {
+  it("calls reclaim with slab keypair when Reclaim SOL clicked", () => {
+    mockStuckSlab = makeStuckSlab({ isInitialized: false, exists: true });
+    render(<RecoverSolBanner />);
+    fireEvent.click(screen.getByRole("button", { name: /RECLAIM/i }));
+    expect(mockReclaim).toHaveBeenCalledWith(mockStuckSlab!.keypair);
+  });
+
+  it("calls onResume with slab address and fromStep=1 when resume clicked on initialized slab", () => {
     const kp = Keypair.generate();
     mockStuckSlab = makeStuckSlab({ isInitialized: true, exists: true, publicKey: kp.publicKey });
     const onResume = vi.fn();
     render(<RecoverSolBanner onResume={onResume} />);
 
     fireEvent.click(screen.getByRole("button", { name: /RESUME/i }));
-    expect(onResume).toHaveBeenCalledWith(kp.publicKey.toBase58());
+    expect(onResume).toHaveBeenCalledWith(kp.publicKey.toBase58(), 1);
+  });
+
+  it("calls onResume with slab address and fromStep=0 when retry clicked on uninitialized slab", () => {
+    const kp = Keypair.generate();
+    mockStuckSlab = makeStuckSlab({ isInitialized: false, exists: true, publicKey: kp.publicKey });
+    const onResume = vi.fn();
+    render(<RecoverSolBanner onResume={onResume} />);
+
+    fireEvent.click(screen.getByRole("button", { name: /RETRY/i }));
+    expect(onResume).toHaveBeenCalledWith(kp.publicKey.toBase58(), 0);
   });
 
   it("calls clearStuck when discard clicked", () => {
@@ -126,7 +171,8 @@ describe("RecoverSolBanner", () => {
       lamports: 3_500_000_000, // 3.5 SOL
     });
     render(<RecoverSolBanner />);
-    expect(screen.getByText(/3\.5000 SOL/)).toBeDefined();
+    // Multiple elements show the SOL amount (banner text + reclaim button)
+    expect(screen.getAllByText(/3\.5000 SOL/).length).toBeGreaterThanOrEqual(1);
   });
 
   it("shows explorer link for stuck uninitialized slab", () => {
@@ -144,5 +190,38 @@ describe("RecoverSolBanner", () => {
     expect(explorerLink).toBeDefined();
     expect(explorerLink?.getAttribute("href")).toContain(kp.publicKey.toBase58());
     expect(explorerLink?.getAttribute("target")).toBe("_blank");
+  });
+
+  it("shows RECLAIM button for initialized slab and calls closeSlab on click", async () => {
+    const kp = Keypair.generate();
+    mockStuckSlab = makeStuckSlab({
+      isInitialized: true,
+      exists: true,
+      publicKey: kp.publicKey,
+      lamports: 2_000_000_000,
+    });
+    mockCloseSlab = vi.fn().mockResolvedValue(null);
+    render(<RecoverSolBanner />);
+
+    const reclaimBtn = screen.getByRole("button", { name: /RECLAIM/i });
+    expect(reclaimBtn).toBeDefined();
+    expect(reclaimBtn.textContent).toMatch(/2\.0000 SOL/);
+    fireEvent.click(reclaimBtn);
+    expect(mockCloseSlab).toHaveBeenCalledWith(kp.publicKey.toBase58());
+  });
+
+  it("shows closeError message when closeSlab fails admin guard", () => {
+    mockStuckSlab = makeStuckSlab({ isInitialized: true, exists: true });
+    mockCloseError = "Only the market admin can close this slab.";
+    render(<RecoverSolBanner />);
+    expect(screen.getByText(/Only the market admin/i)).toBeDefined();
+  });
+
+  it("disables RECLAIM button while closeLoading is true", () => {
+    mockStuckSlab = makeStuckSlab({ isInitialized: true, exists: true });
+    mockCloseLoading = true;
+    render(<RecoverSolBanner />);
+    const reclaimBtn = screen.getByRole("button", { name: /RECLAIMING/i });
+    expect(reclaimBtn).toHaveProperty("disabled", true);
   });
 });

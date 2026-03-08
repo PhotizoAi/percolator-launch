@@ -106,6 +106,35 @@ async function fetchViaHeliusDAS(
 }
 
 /**
+ * Fetch token metadata via DexScreener API.
+ * Covers pump.fun tokens and other community tokens not in Helius DAS.
+ * Free, no API key required. Replaces dead tokens.jup.ag domain (PERC-396).
+ */
+async function fetchViaDexScreener(
+  mintAddress: string,
+): Promise<{ symbol: string; name: string } | null> {
+  try {
+    const res = await fetch(
+      `https://api.dexscreener.com/latest/dex/tokens/${mintAddress}`,
+      { signal: AbortSignal.timeout(5000) },
+    );
+    if (!res.ok) return null;
+    const data = await res.json();
+    // DexScreener returns an array of pairs; the searched mint is always baseToken
+    const baseToken = data?.pairs?.[0]?.baseToken;
+    const symbol = baseToken?.symbol;
+    const name = baseToken?.name;
+    if (!symbol && !name) return null;
+    return {
+      symbol: symbol || shortenMint(mintAddress),
+      name: name || shortenMint(mintAddress),
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Batch-fetch token metadata via Helius DAS getAssetBatch.
  * Resolves up to DAS_BATCH_SIZE assets per call.
  * Returns a Map of mintAddress → { symbol, name, decimals }.
@@ -418,6 +447,16 @@ export async function fetchTokenMeta(
     }
   }
 
+  // 2b. Try DexScreener (covers pump.fun and other community tokens — key-free, PERC-396)
+  if (!resolved) {
+    const dexMeta = await fetchViaDexScreener(key);
+    if (dexMeta) {
+      symbol = dexMeta.symbol;
+      name = dexMeta.name;
+      resolved = true;
+    }
+  }
+
   // 3. Fallback: on-chain Metaplex metadata (manual buffer parsing)
   if (!resolved) {
     try {
@@ -465,7 +504,7 @@ export async function fetchTokenMeta(
     }
   }
 
-  // 4. Fallback — show truncated mint address instead of "Unknown Token"
+  // 4. Fallback — truncated mint address (never blank, never "UNKNOWN-PERP")
   if (!resolved) {
     symbol = shortenMint(key);
     name = shortenMint(key);

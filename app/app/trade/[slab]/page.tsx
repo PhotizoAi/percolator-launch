@@ -1,6 +1,7 @@
 "use client";
 
 import { use, useState, useRef, useEffect } from "react";
+import { useRouter } from "next/navigation";
 import gsap from "gsap";
 import { PublicKey } from "@solana/web3.js";
 import { SlabProvider, useSlabState } from "@/components/providers/SlabProvider";
@@ -29,7 +30,12 @@ import { computeMarketHealth } from "@/lib/health";
 import { useLivePrice } from "@/hooks/useLivePrice";
 import { useTokenMeta } from "@/hooks/useTokenMeta";
 import { useToast } from "@/hooks/useToast";
-import { isPlaceholderSymbol } from "@/lib/symbol-utils";
+import { isPlaceholderSymbol, SLUG_ALIASES } from "@/lib/symbol-utils";
+import { OracleBadge } from "@/components/oracle/OracleBadge";
+import { useOracleFreshness } from "@/hooks/useOracleFreshness";
+import { AutoDepositProvider } from "@/components/providers/AutoDepositProvider";
+import { DevnetFaucetModal } from "@/components/devnet/DevnetFaucetModal";
+import { AirdropButton } from "@/components/trade/AirdropButton";
 
 /* ── Reusable tiny components ─────────────────────────────── */
 
@@ -86,20 +92,23 @@ function Tabs({ tabs, children, defaultTab }: { tabs: string[]; children: React.
   const [active, setActive] = useState(defaultTab ?? 0);
   return (
     <div>
-      <div className="flex border-b border-[var(--border)]/50 bg-transparent">
-        {tabs.map((label, i) => (
-          <button
-            key={label}
-            onClick={() => setActive(i)}
-            className={`px-3 py-1.5 text-[10px] font-medium uppercase tracking-[0.15em] transition-colors border-b-2 ${
-              active === i
-                ? "border-[var(--accent)] text-[var(--accent)]"
-                : "border-transparent text-[var(--text-muted)] hover:text-[var(--text-secondary)] hover:border-[var(--border)]"
-            }`}
-          >
-            {label}
-          </button>
-        ))}
+      {/* overflow-x-auto + whitespace-nowrap prevents 5-tab bar from overflowing at 375px (#860) */}
+      <div className="overflow-x-auto border-b border-[var(--border)]/50 bg-transparent">
+        <div className="flex whitespace-nowrap">
+          {tabs.map((label, i) => (
+            <button
+              key={label}
+              onClick={() => setActive(i)}
+              className={`shrink-0 px-3 py-1.5 text-[10px] font-medium uppercase tracking-[0.15em] transition-colors border-b-2 ${
+                active === i
+                  ? "border-[var(--accent)] text-[var(--accent)]"
+                  : "border-transparent text-[var(--text-muted)] hover:text-[var(--text-secondary)] hover:border-[var(--border)]"
+              }`}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
       </div>
       <div>{children[active]}</div>
     </div>
@@ -140,6 +149,8 @@ function TradePageInner({ slab }: { slab: string }) {
   const tokenMeta = useTokenMeta(config?.collateralMint ?? null);
   const { priceUsd } = useLivePrice();
   const health = engine ? computeMarketHealth(engine) : null;
+  const { mode: oracleMode, level: oracleLevel } = useOracleFreshness();
+  const oracleBadgeStatus = oracleLevel === "stale" ? "stale" : "healthy";
   const pageRef = useRef<HTMLDivElement>(null);
   const shortAddress = `${slab.slice(0, 4)}…${slab.slice(-4)}`;
 
@@ -269,6 +280,7 @@ function TradePageInner({ slab }: { slab: string }) {
           <div className="flex items-center gap-1.5 min-w-0 overflow-hidden">
             <UsdToggleButton />
             {health && <HealthBadge level={health.level} />}
+            {oracleMode && <OracleBadge mode={oracleMode} status={oracleBadgeStatus} />}
             {priceDisplay && (
               <span className="shrink-0 text-sm font-bold text-[var(--text)]" style={{ fontFamily: "var(--font-mono)" }}>{priceDisplay}</span>
             )}
@@ -288,6 +300,7 @@ function TradePageInner({ slab }: { slab: string }) {
               {header.admin.toBase58() === "11111111111111111111111111111111" ? "Admin Renounced" : "Admin Active"}
             </span>
           )}
+          <AirdropButton mintAddress={mintAddress} symbol={symbol} />
           <ShareButton
             slabAddress={slab}
             marketName={symbol}
@@ -330,6 +343,16 @@ function TradePageInner({ slab }: { slab: string }) {
           </>
         )}
 
+        {oracleMode && (
+          <>
+            <span className="h-3.5 w-px bg-[var(--border)]/40" />
+            <OracleBadge
+              mode={oracleMode}
+              status={oracleBadgeStatus}
+            />
+          </>
+        )}
+
         {header?.admin && (
           <>
             <span className="h-3.5 w-px bg-[var(--border)]/40" />
@@ -345,6 +368,7 @@ function TradePageInner({ slab }: { slab: string }) {
 
         {/* Right-aligned controls */}
         <div className="ml-auto flex items-center gap-3">
+          <AirdropButton mintAddress={mintAddress} symbol={symbol} />
           <UsdToggleButton />
           <ShareButton
             slabAddress={slab}
@@ -376,7 +400,7 @@ function TradePageInner({ slab }: { slab: string }) {
         {/* Chart */}
         <ErrorBoundary label="TradingChart">
           <div className="w-full overflow-hidden">
-            <TradingChart slabAddress={slab} />
+            <TradingChart slabAddress={slab} mintAddress={mintAddress || undefined} />
           </div>
         </ErrorBoundary>
 
@@ -404,9 +428,13 @@ function TradePageInner({ slab }: { slab: string }) {
         </ErrorBoundary>
 
         {/* Bottom tabs: Stats | Trades | Book */}
-        <Tabs tabs={["Stats", "Trades", "Risk", "Book"]}>
+        <Tabs tabs={["Stats", "Trades", "Health", "Risk", "Book"]}>
           <ErrorBoundary label="MarketStatsCard"><MarketStatsCard /></ErrorBoundary>
           <ErrorBoundary label="TradeHistory"><TradeHistory slabAddress={slab} /></ErrorBoundary>
+          <ErrorBoundary label="EngineHealthCard">
+            <EngineHealthCard />
+            <div className="mt-2"><CrankHealthCard /></div>
+          </ErrorBoundary>
           <ErrorBoundary label="RiskAnalytics">
             <OpenInterestCard slabAddress={slab} />
             <div className="mt-2"><InsuranceDashboard slabAddress={slab} /></div>
@@ -427,7 +455,7 @@ function TradePageInner({ slab }: { slab: string }) {
         <div className="min-w-0 space-y-1.5">
           {/* Chart */}
           <ErrorBoundary label="TradingChart">
-            <TradingChart slabAddress={slab} />
+            <TradingChart slabAddress={slab} mintAddress={mintAddress || undefined} />
           </ErrorBoundary>
 
           {/* My Positions / Account — tabbed */}
@@ -484,9 +512,9 @@ function InvalidAddressPage({ address }: { address: string }) {
   return (
     <div className="min-h-[calc(100vh-48px)] flex flex-col items-center justify-center gap-3">
       <div className="border border-[var(--short)]/30 bg-[var(--short)]/5 p-6 text-center max-w-md">
-        <p className="text-sm font-medium text-[var(--short)]">Invalid market address</p>
+        <p className="text-sm font-medium text-[var(--short)]">Market not found</p>
         <p className="mt-2 text-[11px] text-[var(--text-secondary)]">
-          The address in the URL is not a valid Solana public key.
+          No market exists for this address or symbol.
         </p>
         <p className="mt-2 text-[10px] text-[var(--text-dim)] break-all" style={{ fontFamily: "var(--font-mono)" }}>{address}</p>
         <a
@@ -500,17 +528,92 @@ function InvalidAddressPage({ address }: { address: string }) {
   );
 }
 
+/**
+ * Handles slugs like "SOL-PERP" or "SOL" that are not valid Solana public keys.
+ * Fetches the markets index and redirects to the resolved slab address.
+ */
+function SlugResolvePage({ slug }: { slug: string }) {
+  const router = useRouter();
+  const [resolveError, setResolveError] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch("/api/markets")
+      .then((r) => r.json())
+      .then((data) => {
+        if (cancelled) return;
+        const markets: Array<{ slab_address: string; symbol?: string; mint_address?: string; volume_24h?: number | null; total_open_interest?: number | null; created_at?: string }> = data.markets ?? [];
+        // Normalize: "SOL-PERP" → "SOL", then match against symbol
+        const slugNorm = slug.toUpperCase().replace(/-PERP$/, "");
+
+        // Sort to prefer the most active slab when multiple markets share the same symbol / mint.
+        // Treat volume_24h=0 and null identically as "no volume" (-1) so a stale slab with
+        // explicit vol=0 never beats a fresh slab with vol=null (fixes issue #721).
+        // Tiebreakers: total_open_interest DESC, then created_at DESC (newest wins).
+        const sorted = [...markets].sort((a, b) => {
+          const va = typeof a.volume_24h === "number" && a.volume_24h > 0 ? a.volume_24h : -1;
+          const vb = typeof b.volume_24h === "number" && b.volume_24h > 0 ? b.volume_24h : -1;
+          if (vb !== va) return vb - va;
+          const oa = typeof a.total_open_interest === "number" && a.total_open_interest > 0 ? a.total_open_interest : -1;
+          const ob = typeof b.total_open_interest === "number" && b.total_open_interest > 0 ? b.total_open_interest : -1;
+          if (ob !== oa) return ob - oa;
+          return new Date(b.created_at ?? 0).getTime() - new Date(a.created_at ?? 0).getTime();
+        });
+
+        // 1. Try matching by symbol name
+        let match = sorted.find((m) => {
+          const sym = (m.symbol ?? "").toUpperCase().replace(/-PERP$/, "");
+          return sym === slugNorm || (m.symbol ?? "").toUpperCase() === slug.toUpperCase();
+        });
+
+        // 2. If no symbol match, try well-known slug aliases (e.g. SOL → mint address)
+        if (!match) {
+          const aliasMint = SLUG_ALIASES[slugNorm];
+          if (aliasMint) {
+            match = sorted.find((m) => m.mint_address === aliasMint);
+          }
+        }
+        if (match) {
+          router.replace(`/trade/${match.slab_address}`);
+        } else {
+          setResolveError(true);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setResolveError(true);
+      });
+    return () => { cancelled = true; };
+  }, [slug, router]);
+
+  if (resolveError) {
+    return <InvalidAddressPage address={slug} />;
+  }
+
+  return (
+    <div className="min-h-[calc(100vh-48px)] flex flex-col items-center justify-center gap-3">
+      <div className="h-8 w-8 animate-spin rounded-full border-2 border-[var(--accent)] border-t-transparent" />
+      <p className="text-[11px] text-[var(--text-muted)] uppercase tracking-[0.15em]">Resolving market…</p>
+      <p className="text-[10px] text-[var(--text-dim)]" style={{ fontFamily: "var(--font-mono)" }}>{slug}</p>
+    </div>
+  );
+}
+
 export default function TradePage({ params }: { params: Promise<{ slab: string }> }) {
   const { slab } = use(params);
 
+  // If not a valid pubkey, try resolving as a market slug (e.g. SOL-PERP)
   if (!isValidPublicKey(slab)) {
-    return <InvalidAddressPage address={slab} />;
+    // Not a valid base58 pubkey — try slug resolution (e.g. "SOL-PERP" → actual slab address)
+    return <SlugResolvePage slug={slab} />;
   }
 
   return (
     <SlabProvider slabAddress={slab}>
       <UsdToggleProvider>
-        <TradePageInner slab={slab} />
+        <AutoDepositProvider slabAddress={slab}>
+          <DevnetFaucetModal />
+          <TradePageInner slab={slab} />
+        </AutoDepositProvider>
       </UsdToggleProvider>
     </SlabProvider>
   );
