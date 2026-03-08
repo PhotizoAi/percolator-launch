@@ -45,17 +45,17 @@ export async function GET(
     // 2. Fallback: market_stats for the most recent price
     const { data: stats } = await (db as any)
       .from("market_stats")
-      .select("mark_price_e6, last_updated")
+      .select("mark_price, updated_at")
       .eq("slab_address", slab)
-      .order("last_updated", { ascending: false })
+      .order("updated_at", { ascending: false })
       .limit(1);
 
     if (stats && stats.length > 0) {
       return NextResponse.json({
         prices: [
           {
-            price_e6: String(stats[0].mark_price_e6),
-            timestamp: new Date(stats[0].last_updated).getTime(),
+            price_e6: String(stats[0].mark_price),
+            timestamp: new Date(stats[0].updated_at).getTime(),
           },
         ],
       });

@@ -1,21 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getServiceClient } from "@/lib/supabase";
+import { requireAuth, UNAUTHORIZED } from "@/lib/api-auth";
+import { getClientIp, createRateLimiter } from "@/lib/route-utils";
 
 export const dynamic = 'force-dynamic';
 
-const rateMap = new Map<string, { count: number; resetAt: number }>();
-
-function isRateLimited(ip: string): boolean {
-  const now = Date.now();
-  const entry = rateMap.get(ip);
-  if (!entry || now > entry.resetAt) {
-    rateMap.set(ip, { count: 1, resetAt: now + 3600_000 });
-    return false;
-  }
-  if (entry.count >= 3) return true;
-  entry.count++;
-  return false;
-}
+const isRateLimited = createRateLimiter(3);
 
 function sanitize(str: string): string {
   return str.replace(/[<>]/g, "").trim();
@@ -23,7 +13,8 @@ function sanitize(str: string): string {
 
 const TABLE = "job_applications";
 
-export async function GET() {
+export async function GET(req: NextRequest) {
+  if (!requireAuth(req)) return UNAUTHORIZED;
   try {
     const sb = getServiceClient();
     const { data, error } = await (sb.from as any)(TABLE)
@@ -39,16 +30,13 @@ export async function GET() {
     return NextResponse.json(data ?? []);
   } catch (err) {
     console.error("GET /api/applications error:", err);
-    return NextResponse.json([], { status: 200 });
+    return NextResponse.json([], { status: 500 });
   }
 }
 
 export async function POST(req: NextRequest) {
   try {
-    const ip =
-      req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ??
-      req.headers.get("x-real-ip") ??
-      "unknown";
+    const ip = getClientIp(req);
 
     if (isRateLimited(ip)) {
       return NextResponse.json(
@@ -78,7 +66,7 @@ export async function POST(req: NextRequest) {
     if (!twitter_handle || twitter_handle.length > 30) {
       return NextResponse.json({ error: "Twitter handle required (max 30 chars)" }, { status: 400 });
     }
-    if (!email || email.length > 200 || !email.includes("@")) {
+    if (!email || email.length > 200 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
       return NextResponse.json({ error: "Valid email required" }, { status: 400 });
     }
     const validRoles = ["developer", "designer", "community", "marketing", "trader", "other"];

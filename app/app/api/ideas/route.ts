@@ -1,22 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getServiceClient } from "@/lib/supabase";
+import { getClientIp, createRateLimiter } from "@/lib/route-utils";
 
 export const dynamic = 'force-dynamic';
 
-// Simple in-memory rate limiter (resets on cold start — fine for serverless)
-const rateMap = new Map<string, { count: number; resetAt: number }>();
-
-function isRateLimited(ip: string): boolean {
-  const now = Date.now();
-  const entry = rateMap.get(ip);
-  if (!entry || now > entry.resetAt) {
-    rateMap.set(ip, { count: 1, resetAt: now + 3600_000 });
-    return false;
-  }
-  if (entry.count >= 5) return true;
-  entry.count++;
-  return false;
-}
+const isRateLimited = createRateLimiter(5);
 
 function sanitize(str: string): string {
   return str.replace(/[<>]/g, "").trim();
@@ -41,16 +29,13 @@ export async function GET() {
     return NextResponse.json(data ?? []);
   } catch (err) {
     console.error("GET /api/ideas error:", err);
-    return NextResponse.json([], { status: 200 });
+    return NextResponse.json([], { status: 500 });
   }
 }
 
 export async function POST(req: NextRequest) {
   try {
-    const ip =
-      req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ??
-      req.headers.get("x-real-ip") ??
-      "unknown";
+    const ip = getClientIp(req);
 
     if (isRateLimited(ip)) {
       return NextResponse.json(

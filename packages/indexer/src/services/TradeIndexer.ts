@@ -1,6 +1,6 @@
 import { Connection, PublicKey, type ParsedTransactionWithMeta } from "@solana/web3.js";
 import { IX_TAG } from "@percolator/sdk";
-import { config, getConnection, insertTrade, tradeExistsBySignature, getMarkets, eventBus, decodeBase58, readU128LE, parseTradeSize, withRetry, createLogger, captureException, addBreadcrumb } from "@percolator/shared";
+import { config, getConnection, insertTrade, getMarkets, eventBus, decodeBase58, readU128LE, parseTradeSize, withRetry, createLogger, captureException, addBreadcrumb } from "@percolator/shared";
 
 const logger = createLogger("indexer:trade-indexer");
 
@@ -272,10 +272,6 @@ export class TradeIndexerPolling {
       // Get price from program logs
       const price = this.extractPriceFromLogs(tx) ?? 0;
       const fee = 0;
-
-      // Check for duplicate
-      const exists = await tradeExistsBySignature(signature);
-      if (exists) return false;
 
       // Validate inputs
       const base58PubkeyRegex = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;

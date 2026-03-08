@@ -211,49 +211,6 @@ export function createBatchRpc(config: BatchRpcConfig) {
   }
 
   /**
-   * `fetchMiddleware` compatible with @solana/web3.js Connection.
-   *
-   * web3.js calls:
-   *   fetchMiddleware(url, options, (modifiedUrl, modifiedOptions) => void)
-   *
-   * We intercept the request, batch it, and call the callback with a
-   * modified fetch function that returns the batched response.
-   */
-  function fetchMiddleware(
-    url: string,
-    options: Record<string, unknown>,
-    fetch: (url: string, options: Record<string, unknown>) => void
-  ): void {
-    // Parse the JSON-RPC body to extract method and params
-    const body = options.body as string;
-    let parsed: { method?: string; params?: unknown };
-    try {
-      parsed = JSON.parse(body);
-    } catch {
-      // Can't parse — pass through unmodified
-      fetch(url, options);
-      return;
-    }
-
-    if (!parsed.method) {
-      fetch(url, options);
-      return;
-    }
-
-    // Enqueue for batching, then reconstruct the response
-    enqueue(parsed.method, parsed.params ?? []).then((resultJson) => {
-      // We need to call the original fetch to satisfy the callback pattern,
-      // but we want to return our batched result.
-      // Unfortunately, fetchMiddleware expects us to call the callback which
-      // then does a real fetch. We can't prevent that.
-      //
-      // Instead, we'll use the customFetch approach.
-      // See createBatchConnection() below.
-      fetch(url, options);
-    });
-  }
-
-  /**
    * Custom fetch function for use with Connection's internal RPC client.
    * This replaces the standard fetch and batches all RPC calls.
    */

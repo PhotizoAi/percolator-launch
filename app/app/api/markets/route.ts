@@ -135,9 +135,12 @@ export async function POST(req: NextRequest) {
   }
 
   // Create initial stats row
+  const priceNum = initial_price_e6 != null ? Number(initial_price_e6) : null;
   await (supabase.from("market_stats") as any).insert({
     slab_address,
-    last_price: initial_price_e6 ? initial_price_e6 / 1_000_000 : null,
+    last_price: priceNum != null && Number.isFinite(priceNum) && priceNum > 0
+      ? priceNum / 1_000_000
+      : null,
   });
 
     return NextResponse.json({ market }, { status: 201 });

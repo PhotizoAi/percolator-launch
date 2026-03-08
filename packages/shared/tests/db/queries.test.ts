@@ -507,6 +507,18 @@ describe("queries", () => {
 
       await expect(get24hVolume("test")).rejects.toEqual(mockError);
     });
+
+    it("should skip unreadable (non-numeric) size rows without throwing", async () => {
+      const mockTrades = [{ size: "1000" }, { size: "not_a_number" }, { size: "-500" }];
+      mockGte.mockResolvedValue({ data: mockTrades, error: null });
+
+      const { get24hVolume } = await import("../../src/db/queries.js");
+      const result = await get24hVolume("test-slab");
+
+      // 1000 + skip + 500 = 1500
+      expect(result.volume).toBe("1500");
+      expect(result.tradeCount).toBe(3);
+    });
   });
 
   describe("getGlobalRecentTrades", () => {

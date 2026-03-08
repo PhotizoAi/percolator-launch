@@ -379,9 +379,86 @@ describe('LiquidationService', () => {
 
       expect(candidates).toHaveLength(0); // Skipped due to stale price and no fallback
     });
-  });
 
-  describe('liquidate', () => {
+    it('should treat authorityTimestamp=0n as uninitialized (not fresh) in admin oracle mode', async () => {
+      // Regression test: previously priceAge fell back to `now` (~1.7e9 s) when
+      // authorityTimestamp == 0n, making `priceAge <= 60n` always false.
+      // But that's the CORRECT behavior — timestamp 0 IS uninitialized, so it
+      // should NOT be considered fresh even if authorityPriceE6 > 0.
+      const mockMarket = {
+        slabAddress: { toBase58: () => 'Market3A1111111111111111111111111111111' },
+        programId: { toBase58: () => 'Program11111111111111111111111111111111' },
+        config: {
+          collateralMint: { toBase58: () => 'So11111111111111111111111111111111111111112' },
+          oracleAuthority: { toBase58: () => 'Oracle11111111111111111111111111111111' },
+          indexFeedId: { toBytes: () => new Uint8Array(32) },
+        },
+        params: { maintenanceMarginBps: 500n },
+        header: { admin: { toBase58: () => 'Admin111111111111111111111111111111111' } },
+      };
+
+      vi.mocked(core.fetchSlab).mockResolvedValue(new Uint8Array(1024));
+      vi.mocked(core.parseEngine).mockReturnValue({ totalOpenInterest: 100_000_000n } as any);
+      vi.mocked(core.parseParams).mockReturnValue({ maintenanceMarginBps: 500n } as any);
+      // authorityTimestamp == 0n: uninitialized — authority price must NOT be used.
+      // lastEffectivePriceE6 == 0n: no fallback either, so price resolves to 0 → skip.
+      vi.mocked(core.parseConfig).mockReturnValue({
+        oracleAuthority: mockNonZeroKey(),
+        indexFeedId: mockNonZeroKey('FeedId111111111111111111111111111111111111'),
+        authorityPriceE6: 50_000_000n, // would cause wrong liquidation if misused
+        lastEffectivePriceE6: 0n,
+        authorityTimestamp: 0n,
+      } as any);
+      vi.mocked(core.detectLayout).mockReturnValue({ accountsOffset: 0 } as any);
+
+      const candidates = await liquidationService.scanMarket(mockMarket as any);
+
+      // Price resolves to 0 (uninitialized timestamp + no fallback) → no candidates
+      expect(candidates).toHaveLength(0);
+    });
+
+    it('should use fresh authority price when authorityTimestamp is recent', async () => {
+      // Confirms the positive case: a recent non-zero timestamp makes authorityFresh=true.
+      const mockMarket = {
+        slabAddress: { toBase58: () => 'Market3B1111111111111111111111111111111' },
+        programId: { toBase58: () => 'Program11111111111111111111111111111111' },
+        config: {
+          collateralMint: { toBase58: () => 'So11111111111111111111111111111111111111112' },
+          oracleAuthority: { toBase58: () => 'Oracle11111111111111111111111111111111' },
+          indexFeedId: { toBytes: () => new Uint8Array(32) },
+        },
+        params: { maintenanceMarginBps: 500n },
+        header: { admin: { toBase58: () => 'Admin111111111111111111111111111111111' } },
+      };
+
+      vi.mocked(core.fetchSlab).mockResolvedValue(new Uint8Array(1024));
+      vi.mocked(core.parseEngine).mockReturnValue({ totalOpenInterest: 100_000_000n } as any);
+      vi.mocked(core.parseParams).mockReturnValue({ maintenanceMarginBps: 500n } as any);
+      // Fresh authority price at $2; fallback is $1. Should use $2 (authority).
+      vi.mocked(core.parseConfig).mockReturnValue({
+        oracleAuthority: mockNonZeroKey(),
+        indexFeedId: mockNonZeroKey('FeedId111111111111111111111111111111111111'),
+        authorityPriceE6: 2_000_000n,
+        lastEffectivePriceE6: 1_000_000n,
+        authorityTimestamp: BigInt(Math.floor(Date.now() / 1000) - 10), // 10 seconds ago (fresh)
+      } as any);
+      vi.mocked(core.detectLayout).mockReturnValue({ accountsOffset: 0 } as any);
+      vi.mocked(core.parseUsedIndices).mockReturnValue([0]);
+      // Position undercollateralized at $2 (authority price)
+      vi.mocked(core.parseAccount).mockReturnValue({
+        kind: 0,
+        owner: { toBase58: () => 'User1111111111111111111111111111111111111' },
+        positionSize: 10_000_000_000n,
+        capital: 1_000_000n, // tiny capital → undercollateralized
+        entryPrice: 2_000_000n,
+      } as any);
+
+      const candidates = await liquidationService.scanMarket(mockMarket as any);
+
+      expect(candidates).toHaveLength(1);
+      expect(candidates[0].accountIdx).toBe(0);
+    });
+
     it('should execute liquidation with multi-instruction transaction', async () => {
       const mockMarket = {
         slabAddress: { toBase58: () => 'Market311111111111111111111111111111111' },
