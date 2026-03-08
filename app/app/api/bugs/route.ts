@@ -23,7 +23,9 @@ function sanitize(str: string): string {
 
 const TABLE = "bug_reports";
 
-export async function GET() {
+export async function GET(req: NextRequest) {
+  if (!requireAuth(req)) return UNAUTHORIZED;
+
   try {
     const sb = getServiceClient();
     const { data, error } = await (sb.from as any)(TABLE)
@@ -42,7 +44,6 @@ export async function GET() {
     return NextResponse.json([], { status: 200 });
   }
 }
-
 export async function POST(req: NextRequest) {
   try {
     const ip =
