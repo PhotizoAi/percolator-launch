@@ -31,11 +31,13 @@ export async function GET(
 
     if (isValidPublicKey(slab)) {
       // Standard lookup by slab address
-      const { data: row, error } = await supabase
-        .from("markets_with_stats")
-        .select("*")
-        .eq("slab_address", slab)
-        .maybeSingle();
+      const { data, error } = await supabase
+       .from("trades")
+       .select("id, trader, side, size, price, fee, tx_signature, created_at")
+       .eq("slab_address", slab)
+       .order("created_at", { ascending: false })
+       .limit(limit);
+      //If the frontend needs additional fields (e.g. liquidation flag, order_id, etc.), add them explicitly.
 
       if (error) {
         Sentry.captureException(error, {
