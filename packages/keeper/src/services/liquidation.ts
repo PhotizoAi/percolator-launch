@@ -109,10 +109,15 @@ function resolveMarketPrice(
   if (mode === "hyperp") {
     return { price: cfg.lastEffectivePriceE6, stale: false };
   }
-  // Admin oracle: try authorityPriceE6 with off-chain staleness check
+  // Admin oracle: try authorityPriceE6 with off-chain staleness check.
+  // Guard authorityTimestamp > 0n explicitly so an uninitialized timestamp (0)
+  // is never treated as "fresh" — previously the priceAge fallback to `now`
+  // (~1.7 billion seconds) made priceAge <= 60n always false, causing valid
+  // authority prices to be silently discarded.
   const now = BigInt(Math.floor(Date.now() / 1000));
-  const priceAge = cfg.authorityTimestamp > 0n ? now - cfg.authorityTimestamp : now;
-  const authorityFresh = cfg.authorityPriceE6 > 0n && priceAge <= 60n;
+  const authorityFresh = cfg.authorityTimestamp > 0n
+    && cfg.authorityPriceE6 > 0n
+    && (now - cfg.authorityTimestamp) <= 60n;
 
   if (authorityFresh) {
     return { price: cfg.authorityPriceE6, stale: false };
