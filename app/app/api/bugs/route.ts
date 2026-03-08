@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getServiceClient } from "@/lib/supabase";
+import { requireAuth, UNAUTHORIZED } from "@/lib/api-auth";
 
 export const dynamic = 'force-dynamic';
 
