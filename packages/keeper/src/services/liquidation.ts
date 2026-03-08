@@ -110,9 +110,9 @@ function resolveMarketPrice(
     return { price: cfg.lastEffectivePriceE6, stale: false };
   }
   // Admin oracle: try authorityPriceE6 with off-chain staleness check
-  const now = BigInt(Math.floor(Date.now() / 1000));
-  const priceAge = cfg.authorityTimestamp > 0n ? now - cfg.authorityTimestamp : now;
-  const authorityFresh = cfg.authorityPriceE6 > 0n && priceAge <= 60n;
+ const authorityFresh = cfg.authorityTimestamp > 0n
+  && cfg.authorityPriceE6 > 0n
+  && (now - cfg.authorityTimestamp) <= 60n;
 
   if (authorityFresh) {
     return { price: cfg.authorityPriceE6, stale: false };
