@@ -29,7 +29,7 @@ export async function GET() {
     return NextResponse.json(data ?? []);
   } catch (err) {
     console.error("GET /api/ideas error:", err);
-    return NextResponse.json([], { status: 200 });
+    return NextResponse.json([], { status: 500 });
   }
 }
 

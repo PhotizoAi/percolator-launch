@@ -30,7 +30,7 @@ export async function GET(req: NextRequest) {
     return NextResponse.json(data ?? []);
   } catch (err) {
     console.error("GET /api/bugs error:", err);
-    return NextResponse.json([], { status: 200 });
+    return NextResponse.json([], { status: 500 });
   }
 }
 

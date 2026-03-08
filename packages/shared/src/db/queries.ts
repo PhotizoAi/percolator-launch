@@ -161,7 +161,11 @@ export async function get24hVolume(slabAddress: string): Promise<{ volume: strin
       const abs = BigInt(row.size) < 0n ? -BigInt(row.size) : BigInt(row.size);
       total += abs;
     } catch {
-      total += BigInt(Math.abs(Number(row.size)));
+      const n = Number(row.size);
+      if (Number.isFinite(n)) {
+        total += BigInt(Math.trunc(Math.abs(n)));
+      }
+      // else: skip unreadable row
     }
   }
   return { volume: total.toString(), tradeCount: (data ?? []).length };
