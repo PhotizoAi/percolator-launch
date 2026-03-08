@@ -108,6 +108,21 @@ export async function POST(req: NextRequest) {
 
   const supabase = getServiceClient();
 
+  // Validate and coerce numeric fields before DB insertion.
+  // Passing non-numeric strings (e.g. "NaN") through unguarded `|| default`
+  // or raw assignment causes PostgreSQL to silently store its special NaN
+  // numeric value via CAST('NaN' AS numeric).
+  const safeFinite = (v: unknown, fallback: number): number => {
+    if (v == null) return fallback;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : fallback;
+  };
+  const safeInitialPriceE6: number | null = (() => {
+    if (initial_price_e6 == null) return null;
+    const n = Number(initial_price_e6);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  })();
+
   // Insert market
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const { data: market, error: marketError } = await (supabase
@@ -117,12 +132,12 @@ export async function POST(req: NextRequest) {
       mint_address,
       symbol: symbol || mint_address.slice(0, 4).toUpperCase(),
       name: name || `Token ${mint_address.slice(0, 8)}`,
-      decimals: decimals || 6,
+      decimals: safeFinite(decimals, 6),
       deployer,
       oracle_authority: oracle_authority || deployer,
-      initial_price_e6,
-      max_leverage: max_leverage || 10,
-      trading_fee_bps: trading_fee_bps || 10,
+      initial_price_e6: safeInitialPriceE6,
+      max_leverage: safeFinite(max_leverage, 10),
+      trading_fee_bps: safeFinite(trading_fee_bps, 10),
       lp_collateral,
       matcher_context,
       logo_url: logo_url || null,
@@ -135,12 +150,9 @@ export async function POST(req: NextRequest) {
   }
 
   // Create initial stats row
-  const priceNum = initial_price_e6 != null ? Number(initial_price_e6) : null;
   await (supabase.from("market_stats") as any).insert({
     slab_address,
-    last_price: priceNum != null && Number.isFinite(priceNum) && priceNum > 0
-      ? priceNum / 1_000_000
-      : null,
+    last_price: safeInitialPriceE6 != null ? safeInitialPriceE6 / 1_000_000 : null,
   });
 
     return NextResponse.json({ market }, { status: 201 });
