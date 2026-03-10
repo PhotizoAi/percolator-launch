@@ -11,10 +11,10 @@ import {
   PublicKey,
   Transaction,
   ComputeBudgetProgram,
-  sendAndConfirmTransaction,
   SYSVAR_CLOCK_PUBKEY,
   LAMPORTS_PER_SOL,
 } from "@solana/web3.js";
+import type { ResilientRpc } from "./rpc.js";
 import {
   getAssociatedTokenAddress,
   getAccount,
@@ -39,12 +39,32 @@ import {
   WELL_KNOWN,
   deriveVaultAuthority,
   deriveLpPda,
+  derivePythPushOraclePDA,
   discoverMarkets,
   parseAllAccounts,
   type DiscoveredMarket,
 } from "@percolator/sdk";
 import type { BotConfig } from "./config.js";
 import { log, logError } from "./logger.js";
+
+// ═══════════════════════════════════════════════════════════════
+// RPC resilience helper
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * Execute an RPC read with retry via ResilientRpc when available.
+ * Falls back to a direct call on the bare connection when rpc is undefined.
+ * This ensures ALL connection reads (not just tx sends) get 429 backoff.
+ */
+async function withRpc<T>(
+  rpc: ResilientRpc | undefined,
+  connection: Connection,
+  op: (conn: Connection) => Promise<T>,
+  label: string,
+): Promise<T> {
+  if (rpc) return rpc.withRetry(op, label);
+  return op(connection);
+}
 
 // ═══════════════════════════════════════════════════════════════
 // Types
@@ -61,6 +81,8 @@ export interface ManagedMarket {
   matcherProgram: PublicKey;
   matcherContext: PublicKey;
   oracleMode: "authority" | "pyth";
+  /** Hex-encoded Pyth feed ID (64 chars). All-zeros for authority-mode markets. */
+  oracleFeedHex: string;
   // State tracking
   positionSize: bigint;
   collateral: bigint;
@@ -172,13 +194,14 @@ function inferSymbolFromPrice(
 export async function resolveSymbolFromSlab(
   connection: Connection,
   slabAddress: PublicKey,
+  rpc?: ResilientRpc,
 ): Promise<string> {
   // Env override takes priority
   const override = SYMBOL_OVERRIDES[slabAddress.toBase58()];
   if (override) return override;
 
   try {
-    const info = await connection.getAccountInfo(slabAddress);
+    const info = await withRpc(rpc, connection, (c) => c.getAccountInfo(slabAddress), "resolveSymbol");
     if (!info) return "UNKNOWN";
     const data = new Uint8Array(info.data);
     // Read authorityPriceE6 and lastEffectivePriceE6 from the on-chain config.
@@ -196,6 +219,13 @@ export async function resolveSymbolFromSlab(
 // Transaction helpers
 // ═══════════════════════════════════════════════════════════════
 
+/**
+ * Sentinel returned by sendTx when the instruction fails with Custom:1
+ * (UserExists / AlreadyInitialized). Callers should treat this as a
+ * non-fatal "already set up" result and re-fetch on-chain state.
+ */
+export const ALREADY_INITIALIZED = "ALREADY_INITIALIZED" as const;
+
 async function sendTx(
   connection: Connection,
   ixs: any[],
@@ -203,7 +233,8 @@ async function sendTx(
   label: string,
   computeUnits = 400_000,
   dryRun = false,
-): Promise<string | null> {
+  rpc?: ResilientRpc,
+): Promise<string | typeof ALREADY_INITIALIZED | null> {
   if (dryRun) {
     log("tx", `[DRY RUN] ${label}`);
     return "(dry-run)";
@@ -213,14 +244,32 @@ async function sendTx(
   tx.add(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50_000 }));
   for (const ix of ixs) tx.add(ix);
   try {
-    const sig = await sendAndConfirmTransaction(connection, tx, signers, {
-      commitment: "confirmed",
-      skipPreflight: true,
-    });
+    let sig: string;
+    if (rpc) {
+      // Use ResilientRpc with exponential backoff + endpoint rotation on 429s
+      sig = await rpc.sendAndConfirmTx(tx, signers, undefined, label);
+    } else {
+      // Fallback: direct send (legacy callers)
+      const { sendAndConfirmTransaction } = await import("@solana/web3.js");
+      sig = await sendAndConfirmTransaction(connection, tx, signers, {
+        commitment: "confirmed",
+        skipPreflight: true,
+      });
+    }
     log("tx", `✅ ${label} → ${sig.slice(0, 16)}...`);
     return sig;
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
+    // Custom:1 = UserExists / AlreadyInitialized — not an error, account already set up.
+    // Return sentinel so callers can skip re-init and refetch on-chain state.
+    const isUserExists =
+      msg.includes("Custom:1") ||
+      msg.match(/custom program error:\s*0x1\b/) ||
+      msg.match(/InstructionError.*?Custom\(1\)/);
+    if (isUserExists) {
+      log("tx", `${label}: already initialized (Custom:1) — skipping`);
+      return ALREADY_INITIALIZED;
+    }
     // Extract custom program error code if present
     const customMatch = msg.match(/custom program error:\s*0x([0-9a-fA-F]+)/);
     const instrMatch = msg.match(/InstructionError.*?Custom\((\d+)\)/);
@@ -245,15 +294,16 @@ async function ensureSolBalance(
   connection: Connection,
   wallet: Keypair,
   label: string,
+  rpc?: ResilientRpc,
 ): Promise<boolean> {
-  const balance = await connection.getBalance(wallet.publicKey);
+  const balance = await withRpc(rpc, connection, (c) => c.getBalance(wallet.publicKey), `${label} getBalance`);
   const balSol = balance / LAMPORTS_PER_SOL;
   if (balSol >= MIN_SOL_FOR_TX) return true;
 
   log("setup", `${label}: wallet ${wallet.publicKey.toBase58().slice(0, 12)}... has ${balSol.toFixed(4)} SOL — attempting devnet airdrop`);
   try {
-    const sig = await connection.requestAirdrop(wallet.publicKey, AIRDROP_SOL * LAMPORTS_PER_SOL);
-    await connection.confirmTransaction(sig, "confirmed");
+    const sig = await withRpc(rpc, connection, (c) => c.requestAirdrop(wallet.publicKey, AIRDROP_SOL * LAMPORTS_PER_SOL), `${label} airdrop`);
+    await withRpc(rpc, connection, (c) => c.confirmTransaction(sig, "confirmed"), `${label} confirmAirdrop`);
     const newBal = await connection.getBalance(wallet.publicKey);
     log("setup", `${label}: airdrop OK — now ${(newBal / LAMPORTS_PER_SOL).toFixed(4)} SOL`);
     return true;
@@ -278,10 +328,11 @@ async function ensureWalletAta(
   mint: PublicKey,
   label: string,
   dryRun = false,
+  rpc?: ResilientRpc,
 ): Promise<PublicKey> {
   const ata = await getAssociatedTokenAddress(mint, owner);
   try {
-    await getAccount(connection, ata);
+    await withRpc(rpc, connection, (c) => getAccount(c, ata), `${label} getATA`);
     return ata; // already exists
   } catch (e) {
     // Only proceed to create if the account genuinely doesn't exist.
@@ -300,10 +351,16 @@ async function ensureWalletAta(
     tx.add(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50_000 }));
     tx.add(ix);
     try {
-      const sig = await sendAndConfirmTransaction(connection, tx, [payer], {
-        commitment: "confirmed",
-        skipPreflight: false,
-      });
+      let sig: string;
+      if (rpc) {
+        sig = await rpc.sendAndConfirmTx(tx, [payer], { skipPreflight: false }, `${label} createATA`);
+      } else {
+        const { sendAndConfirmTransaction } = await import("@solana/web3.js");
+        sig = await sendAndConfirmTransaction(connection, tx, [payer], {
+          commitment: "confirmed",
+          skipPreflight: false,
+        });
+      }
       log("setup", `${label}: ✅ created ATA ${ata.toBase58().slice(0, 16)}... → ${sig.slice(0, 16)}...`);
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -351,6 +408,7 @@ export async function setupMarketAccounts(
   wallet: Keypair,
   depositCollateral: bigint,
   createLp: boolean,
+  rpc?: ResilientRpc,
 ): Promise<ManagedMarket | null> {
   const symbol = inferSymbol(market);
   const slab = market.slabAddress;
@@ -363,7 +421,7 @@ export async function setupMarketAccounts(
   const vaultAta = await getAssociatedTokenAddress(mint, vaultPda, true);
 
   // Fetch full slab to find existing accounts
-  const slabInfo = await connection.getAccountInfo(slab);
+  const slabInfo = await withRpc(rpc, connection, (c) => c.getAccountInfo(slab), `${symbol} fetchSlab`);
   if (!slabInfo) {
     logError("setup", `${symbol}: slab not found`);
     return null;
@@ -385,9 +443,9 @@ export async function setupMarketAccounts(
 
   // Create LP if needed and requested
   if (!lpAccount && createLp) {
-    await ensureSolBalance(connection, wallet, symbol);
+    await ensureSolBalance(connection, wallet, symbol, rpc);
     // Ensure walletAta exists before attempting LP init (fee is debited from it)
-    walletAta = await ensureWalletAta(connection, wallet, wallet.publicKey, mint, symbol, config.dryRun);
+    walletAta = await ensureWalletAta(connection, wallet, wallet.publicKey, mint, symbol, config.dryRun, rpc);
     log("setup", `${symbol}: creating LP account...`);
     const initLpData = encodeInitLP({
       matcherProgram: config.matcherProgramId,
@@ -398,12 +456,12 @@ export async function setupMarketAccounts(
       wallet.publicKey, slab, walletAta, vaultAta, WELL_KNOWN.tokenProgram,
     ]);
     const ix = buildIx({ programId, keys: initLpKeys, data: initLpData });
-    const sig = await sendTx(connection, [ix], [wallet], `${symbol} InitLP`, 200_000, config.dryRun);
+    const sig = await sendTx(connection, [ix], [wallet], `${symbol} InitLP`, 200_000, config.dryRun, rpc);
     if (!sig) return null;
 
-    // Refetch
+    // Refetch (skip if already initialized — account exists on-chain)
     await sleep(1500);
-    const slabInfo2 = await connection.getAccountInfo(slab);
+    const slabInfo2 = await withRpc(rpc, connection, (c) => c.getAccountInfo(slab), `${symbol} refetchSlab-LP`);
     if (slabInfo2) {
       accounts = parseAllAccounts(new Uint8Array(slabInfo2.data));
       lpAccount = accounts.find(
@@ -423,20 +481,21 @@ export async function setupMarketAccounts(
 
   // Create user if needed
   if (!userAccount) {
-    await ensureSolBalance(connection, wallet, symbol);
+    await ensureSolBalance(connection, wallet, symbol, rpc);
     // Ensure walletAta exists before attempting InitUser (1 USDC fee is debited from it)
-    walletAta = await ensureWalletAta(connection, wallet, wallet.publicKey, mint, symbol, config.dryRun);
+    walletAta = await ensureWalletAta(connection, wallet, wallet.publicKey, mint, symbol, config.dryRun, rpc);
     log("setup", `${symbol}: creating user account...`);
     const initUserData = encodeInitUser({ feePayment: "1000000" });
     const initUserKeys = buildAccountMetas(ACCOUNTS_INIT_USER, [
       wallet.publicKey, slab, walletAta, vaultAta, WELL_KNOWN.tokenProgram,
     ]);
     const ix = buildIx({ programId, keys: initUserKeys, data: initUserData });
-    const sig = await sendTx(connection, [ix], [wallet], `${symbol} InitUser`, 200_000, config.dryRun);
+    const sig = await sendTx(connection, [ix], [wallet], `${symbol} InitUser`, 200_000, config.dryRun, rpc);
+    // null = real failure; ALREADY_INITIALIZED = account exists (Custom:1) — refetch and continue
     if (!sig) return null;
 
     await sleep(1500);
-    const slabInfo2 = await connection.getAccountInfo(slab);
+    const slabInfo2 = await withRpc(rpc, connection, (c) => c.getAccountInfo(slab), `${symbol} refetchSlab-User`);
     if (slabInfo2) {
       accounts = parseAllAccounts(new Uint8Array(slabInfo2.data));
       userAccount = accounts.find(
@@ -459,7 +518,7 @@ export async function setupMarketAccounts(
         wallet.publicKey, slab, walletAta, vaultAta, WELL_KNOWN.tokenProgram, SYSVAR_CLOCK_PUBKEY,
       ]);
       const depositIx = buildIx({ programId, keys: depositKeys, data: depositData });
-      await sendTx(connection, [depositIx], [wallet], `${symbol} Deposit`, 200_000, config.dryRun);
+      await sendTx(connection, [depositIx], [wallet], `${symbol} Deposit`, 200_000, config.dryRun, rpc);
     }
   }
 
@@ -491,6 +550,7 @@ export async function setupMarketAccounts(
     matcherProgram: lpAccount.account.matcherProgram ?? config.matcherProgramId,
     matcherContext: lpAccount.account.matcherContext ?? PublicKey.default,
     oracleMode: isHyperp ? "authority" : "pyth",
+    oracleFeedHex: feedHex,
     positionSize: userAccount.account.positionSize ?? 0n,
     collateral: userAccount.account.capital ?? depositCollateral,
     lastOraclePriceE6: 0n,
@@ -504,6 +564,17 @@ export async function setupMarketAccounts(
 // ═══════════════════════════════════════════════════════════════
 
 /**
+ * Derive the oracle account key for a market.
+ * Authority-mode markets use the slab address directly;
+ * Pyth-mode markets use the Pyth push oracle PDA.
+ */
+function getOracleKey(market: ManagedMarket): PublicKey {
+  return market.oracleMode === "authority"
+    ? market.slabAddress
+    : derivePythPushOraclePDA(market.oracleFeedHex)[0];
+}
+
+/**
  * Crank a market (process funding, liquidations, etc).
  */
 export async function crankMarket(
@@ -511,17 +582,17 @@ export async function crankMarket(
   config: BotConfig,
   market: ManagedMarket,
   wallet: Keypair,
+  rpc?: ResilientRpc,
 ): Promise<boolean> {
   const crankData = encodeKeeperCrank({ callerIdx: 65535, allowPanic: false });
-  const oracleKey = market.oracleMode === "authority" ? market.slabAddress : market.slabAddress; // TODO: derive pyth PDA
   const crankKeys = buildAccountMetas(ACCOUNTS_KEEPER_CRANK, [
     wallet.publicKey,
     market.slabAddress,
     SYSVAR_CLOCK_PUBKEY,
-    oracleKey,
+    getOracleKey(market),
   ]);
   const ix = buildIx({ programId: market.programId, keys: crankKeys, data: crankData });
-  const sig = await sendTx(connection, [ix], [wallet], `${market.symbol} Crank`, 200_000, config.dryRun);
+  const sig = await sendTx(connection, [ix], [wallet], `${market.symbol} Crank`, 200_000, config.dryRun, rpc);
   return sig !== null;
 }
 
@@ -534,6 +605,7 @@ export async function pushOraclePrice(
   market: ManagedMarket,
   wallet: Keypair,
   priceE6: bigint,
+  rpc?: ResilientRpc,
 ): Promise<boolean> {
   if (market.oracleMode !== "authority") return true;
   if (priceE6 === market.lastOraclePriceE6) return true;
@@ -545,7 +617,7 @@ export async function pushOraclePrice(
     market.slabAddress,
   ]);
   const ix = buildIx({ programId: market.programId, keys: pushKeys, data: pushData });
-  const sig = await sendTx(connection, [ix], [wallet], `${market.symbol} OraclePush $${Number(priceE6) / 1e6}`, 200_000, config.dryRun);
+  const sig = await sendTx(connection, [ix], [wallet], `${market.symbol} OraclePush $${Number(priceE6) / 1e6}`, 200_000, config.dryRun, rpc);
   if (sig) market.lastOraclePriceE6 = priceE6;
   return sig !== null;
 }
@@ -561,14 +633,14 @@ export async function executeTrade(
   wallet: Keypair,
   size: bigint,
   label: string,
+  rpc?: ResilientRpc,
 ): Promise<TradeResult> {
   const [lpPda] = deriveLpPda(market.programId, market.slabAddress, market.lpIdx);
 
   // Crank first to apply latest oracle
   const crankData = encodeKeeperCrank({ callerIdx: 65535, allowPanic: false });
-  const oracleKey = market.oracleMode === "authority" ? market.slabAddress : market.slabAddress;
   const crankKeys = buildAccountMetas(ACCOUNTS_KEEPER_CRANK, [
-    wallet.publicKey, market.slabAddress, SYSVAR_CLOCK_PUBKEY, oracleKey,
+    wallet.publicKey, market.slabAddress, SYSVAR_CLOCK_PUBKEY, getOracleKey(market),
   ]);
   const crankIx = buildIx({ programId: market.programId, keys: crankKeys, data: crankData });
 
@@ -582,7 +654,7 @@ export async function executeTrade(
     wallet.publicKey,
     market.lpOwner,
     market.slabAddress,
-    oracleKey,
+    getOracleKey(market),
     market.matcherProgram,
     market.matcherContext,
     lpPda,
@@ -596,6 +668,7 @@ export async function executeTrade(
     `${market.symbol} ${label}`,
     600_000,
     config.dryRun,
+    rpc,
   );
 
   if (sig) {
@@ -612,9 +685,10 @@ export async function refreshPosition(
   connection: Connection,
   market: ManagedMarket,
   wallet: Keypair,
+  rpc?: ResilientRpc,
 ): Promise<void> {
   try {
-    const slabInfo = await connection.getAccountInfo(market.slabAddress);
+    const slabInfo = await withRpc(rpc, connection, (c) => c.getAccountInfo(market.slabAddress), `${market.symbol} refreshPos`);
     if (!slabInfo) return;
     const accounts = parseAllAccounts(new Uint8Array(slabInfo.data));
     const userAcc = accounts.find(

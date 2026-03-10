@@ -34,6 +34,7 @@ import { MakerBot } from "./maker.js";
 import { TraderFleetBot } from "./trader-fleet.js";
 import { startHealthServer } from "./health.js";
 import { log, logError } from "./logger.js";
+import { ResilientRpc, parseRpcEndpoints } from "./rpc.js";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
@@ -84,6 +85,31 @@ materializeKeypairFromEnv("FILLER_KEYPAIR_JSON", "FILLER_KEYPAIR", "filler.json"
 materializeKeypairFromEnv("MAKER_KEYPAIR_JSON", "MAKER_KEYPAIR", "maker.json");
 // Also support BOOTSTRAP_KEYPAIR_JSON for single-wallet mode
 materializeKeypairFromEnv("BOOTSTRAP_KEYPAIR_JSON", "BOOTSTRAP_KEYPAIR", "bootstrap.json");
+
+// ═══════════════════════════════════════════════════════════════
+// Global rejection safety net — prevent 429 / transient RPC errors
+// from crashing the process. Log and continue instead.
+// ═══════════════════════════════════════════════════════════════
+process.on("unhandledRejection", (reason: unknown) => {
+  const msg = reason instanceof Error ? reason.message : String(reason);
+  // 429 / network transients are expected under high load — don't crash
+  const isTransient =
+    msg.includes("429") ||
+    msg.includes("Too Many Requests") ||
+    msg.includes("rate limit") ||
+    msg.includes("ECONNRESET") ||
+    msg.includes("ETIMEDOUT") ||
+    msg.includes("fetch failed") ||
+    msg.includes("socket hang up");
+  if (isTransient) {
+    console.warn(`[main] unhandledRejection (transient, ignored): ${msg.slice(0, 200)}`);
+  } else {
+    console.error(`[main] unhandledRejection: ${msg.slice(0, 500)}`);
+    if (reason instanceof Error && reason.stack) {
+      console.error(reason.stack.slice(0, 1000));
+    }
+  }
+});
 
 // ═══════════════════════════════════════════════════════════════
 // Banner
@@ -162,7 +188,10 @@ async function main() {
   const config = loadConfig();
   printBanner(config);
 
-  const connection = new Connection(config.rpcUrl, "confirmed");
+  // PERC-532: Use resilient RPC with exponential backoff + endpoint rotation
+  const rpcEndpoints = parseRpcEndpoints(config.rpcUrl);
+  const rpc = new ResilientRpc(rpcEndpoints, "confirmed");
+  const connection = rpc.connection;
 
   // Verify programs exist
   const programsOk = await checkPrograms(connection, config);
@@ -181,7 +210,7 @@ async function main() {
     if (!walletOk) {
       log("main", "Filler wallet not available — skipping filler");
     } else {
-      filler = new FillerBot(connection, config);
+      filler = new FillerBot(connection, config, rpc);
     }
   }
 
@@ -190,12 +219,12 @@ async function main() {
     if (!walletOk) {
       log("main", "Maker wallet not available — skipping maker");
     } else {
-      maker = new MakerBot(connection, config);
+      maker = new MakerBot(connection, config, rpc);
     }
   }
 
   if (config.mode === "trader" || config.mode === "all") {
-    traderFleet = new TraderFleetBot(connection, config);
+    traderFleet = new TraderFleetBot(connection, config, rpc);
     log("main", `Trader fleet: ${process.env.TRADER_FLEET_SIZE ?? 5} simulated wallets`);
   }
 
@@ -232,6 +261,7 @@ async function main() {
       const s = traderFleet.getStatus().stats;
       log("main", `  Fleet: cycles=${s.cycleCount} | trades=${s.totalTrades} ok / ${s.totalFailed} fail | traders=${s.activeTraders}`);
     }
+    log("main", `  RPC: retries=${rpc.stats.totalRetries} | 429s=${rpc.stats.rateLimitHits} | rotations=${rpc.stats.totalRotations} | endpoint=${rpc.currentEndpoint}`);
     log("main", "═══════════════");
   }, 60_000);
 
