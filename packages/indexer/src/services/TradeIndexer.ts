@@ -276,10 +276,6 @@ export class TradeIndexerPolling {
       }
       const fee = 0;
 
-      // Check for duplicate
-      const exists = await tradeExistsBySignature(signature);
-      if (exists) return false;
-
       // Validate inputs
       const base58PubkeyRegex = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
       const base58SigRegex = /^[1-9A-HJ-NP-Za-km-z]{64,88}$/;
