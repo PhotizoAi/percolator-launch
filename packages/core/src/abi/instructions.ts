@@ -71,6 +71,17 @@ export const IX_TAG = {
   DepositLpCollateral: 45,
   /** PERC-315: Withdraw LP collateral (position must be closed) */
   WithdrawLpCollateral: 46,
+  // Tags 47-53 reserved
+  /** Cross-Market Portfolio Margining: SetOffsetPair */
+  SetOffsetPair: 54,
+  /** Cross-Market Portfolio Margining: AttestCrossMargin */
+  AttestCrossMargin: 55,
+  /** PERC-622: Advance oracle phase (permissionless crank) */
+  AdvanceOraclePhase: 56,
+  /** PERC-623: Top up keeper fund (permissionless) */
+  TopUpKeeperFund: 57,
+  /** PERC-629: Slash creation deposit (permissionless crank) */
+  SlashCreationDeposit: 58,
 } as const;
 
 /**
@@ -826,3 +837,98 @@ export function computeVammQuote(
     return (oraclePriceE6 * (BPS_DENOM - totalBps)) / BPS_DENOM;
   }
 }
+
+// ============================================================================
+// PERC-622: AdvanceOraclePhase (permissionless crank)
+// ============================================================================
+
+/**
+ * AdvanceOraclePhase (Tag 56) — permissionless oracle phase advancement.
+ *
+ * Checks if a market should transition from Phase 0→1→2 based on
+ * time elapsed and cumulative volume. Anyone can call this.
+ *
+ * Instruction data: 1 byte (tag only)
+ *
+ * Accounts:
+ *   0. [writable] Slab
+ */
+export function encodeAdvanceOraclePhase(): Uint8Array {
+  return encU8(IX_TAG.AdvanceOraclePhase);
+}
+
+/** Oracle phase constants matching on-chain values */
+export const ORACLE_PHASE_NASCENT = 0;
+export const ORACLE_PHASE_GROWING = 1;
+export const ORACLE_PHASE_MATURE = 2;
+
+/** Phase transition thresholds (must match program constants) */
+export const PHASE1_MIN_SLOTS = 648_000n;         // ~72h at 400ms
+export const PHASE1_VOLUME_MIN_SLOTS = 36_000n;    // ~4h at 400ms
+export const PHASE2_VOLUME_THRESHOLD = 100_000_000_000n; // $100K in e6
+export const PHASE2_MATURITY_SLOTS = 3_024_000n;   // ~14 days at 400ms
+
+/**
+ * Check if an oracle phase transition is due (TypeScript mirror of on-chain logic).
+ *
+ * @returns [newPhase, shouldTransition]
+ */
+export function checkPhaseTransition(
+  currentSlot: bigint,
+  marketCreatedSlot: bigint,
+  oraclePhase: number,
+  cumulativeVolumeE6: bigint,
+  phase2DeltaSlots: number,
+  hasMatureOracle: boolean,
+): [number, boolean] {
+  switch (oraclePhase) {
+    case 0: {
+      const elapsed = currentSlot - (marketCreatedSlot > 0n ? marketCreatedSlot : currentSlot);
+      const timeReady = elapsed >= PHASE1_MIN_SLOTS;
+      const volumeReady = elapsed >= PHASE1_VOLUME_MIN_SLOTS
+        && cumulativeVolumeE6 >= PHASE2_VOLUME_THRESHOLD;
+      if (timeReady || volumeReady) {
+        return [ORACLE_PHASE_GROWING, true];
+      }
+      return [ORACLE_PHASE_NASCENT, false];
+    }
+    case 1: {
+      if (hasMatureOracle) return [ORACLE_PHASE_MATURE, true];
+      const phase2Start = marketCreatedSlot + BigInt(phase2DeltaSlots);
+      const elapsedSincePhase2 = currentSlot - phase2Start;
+      if (elapsedSincePhase2 >= PHASE2_MATURITY_SLOTS) {
+        return [ORACLE_PHASE_MATURE, true];
+      }
+      return [ORACLE_PHASE_GROWING, false];
+    }
+    default:
+      return [ORACLE_PHASE_MATURE, false];
+  }
+}
+
+// ============================================================================
+// PERC-623: Keeper Fund Instructions
+// ============================================================================
+
+/**
+ * TopUpKeeperFund (Tag 57) — permissionless keeper fund top-up.
+ *
+ * Instruction data: tag(1) + amount(8) = 9 bytes
+ *
+ * Accounts:
+ *   0. [signer, writable] Funder
+ *   1. [writable]         Slab
+ *   2. [writable]         Keeper fund PDA
+ *   3. []                 System program
+ */
+export interface TopUpKeeperFundArgs {
+  amount: bigint | string;
+}
+
+export function encodeTopUpKeeperFund(args: TopUpKeeperFundArgs): Uint8Array {
+  return concatBytes(encU8(IX_TAG.TopUpKeeperFund), encU64(args.amount));
+}
+
+// Note: WithdrawKeeperReward does NOT exist as a separate instruction.
+// Keeper rewards are paid automatically during KeeperCrank (tag 5).
+// The keeper fund PDA is debited in-place when a successful crank is executed.

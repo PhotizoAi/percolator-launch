@@ -19,10 +19,6 @@ import { isMockSlab, getMockUserAccount } from "@/lib/mock-trade-data";
 
 interface DepositWithdrawCardProps {
   slabAddress: string;
-  /**
-   * PERC-475: When true (devnet mirror market with a mainnet_ca), show a
-   * "Get [SYMBOL] Tokens" faucet button so users can mint $500 of devnet tokens.
-   */
   isDevnetMirror?: boolean;
 }
 
@@ -75,9 +71,6 @@ export const DepositWithdrawCard: FC<DepositWithdrawCardProps> = ({ slabAddress,
 
   if (!userAccount) {
     const hasTokens = walletBalance !== null && walletBalance > 0n;
-    const suggestedDeposit = walletBalance !== null && walletBalance > 0n
-      ? walletBalance > 10_000_000n ? 10_000_000n : walletBalance
-      : 0n;
     return (
       <div className="relative rounded-none border border-[var(--border)]/50 bg-[var(--bg)]/80 p-3">
         <p className="mb-1 text-[10px] uppercase tracking-[0.15em] text-[var(--text-dim)]">Create Account</p>
@@ -91,14 +84,17 @@ export const DepositWithdrawCard: FC<DepositWithdrawCardProps> = ({ slabAddress,
             <p className="text-[10px] text-[var(--warning)]">
               You need {symbol} tokens to trade this market.
             </p>
-            {/* PERC-475: Devnet mirror market — show self-service faucet button */}
-            {isDevnetMirror && mktConfig?.collateralMint ? (
+            {/* Show devnet faucet button for all devnet markets */}
+            {mktConfig?.collateralMint ? (
               <DevnetTokenFaucetButton
                 mintAddress={mktConfig.collateralMint.toBase58()}
                 symbol={symbol}
               />
             ) : mktConfig?.collateralMint ? (
-              <a href="/devnet-mint" className="text-[10px] text-[var(--warning)] underline underline-offset-2 hover:text-[var(--warning)]/80">
+              <a
+                href={`/devnet-mint?mint=${mktConfig.collateralMint.toBase58()}&symbol=${encodeURIComponent(symbol)}`}
+                className="text-[10px] text-[var(--warning)] underline underline-offset-2 hover:text-[var(--warning)]/80"
+              >
                 Mint some from the faucet →
               </a>
             ) : null}
@@ -107,23 +103,23 @@ export const DepositWithdrawCard: FC<DepositWithdrawCardProps> = ({ slabAddress,
         {hasTokens ? (
           <>
             <p className="mb-2 text-[10px] text-[var(--text-secondary)]">
-              Create an account with an initial deposit to start trading.
+              Create your trading account on this market to start trading.
             </p>
             <button
               onClick={async () => { 
                 try { 
-                  const sig = await initUser(suggestedDeposit); 
+                  // feePayment=0 — just registers the slot.
+                  // Actual deposit follows in the deposit form once account exists.
+                  const sig = await initUser(0n); 
                   setLastSig(sig ?? null); 
-                } catch (err) {
-                  if (process.env.NODE_ENV === 'development') {
-                    console.error('initUser failed:', err);
-                  }
+                } catch {
+                  // initError state is set by the hook and shown below
                 }
               }}
               disabled={initLoading}
               className="w-full rounded-none bg-[var(--accent)] py-2 text-[10px] font-medium uppercase tracking-[0.1em] text-white hover:bg-[var(--accent-muted)] hover:scale-[1.01] active:scale-[0.99] transition-transform disabled:opacity-50"
             >
-              {initLoading ? "Creating..." : `Create Account (deposit ${formatTokenAmount(suggestedDeposit, decimals)} ${symbol})`}
+              {initLoading ? "Creating account..." : "Create Trading Account"}
             </button>
           </>
         ) : (
@@ -217,7 +213,10 @@ export const DepositWithdrawCard: FC<DepositWithdrawCardProps> = ({ slabAddress,
               symbol={symbol}
             />
           ) : (
-            <a href="/devnet-mint" className="text-[10px] text-[var(--warning)] underline underline-offset-2 hover:text-[var(--warning)]/80">
+            <a
+              href={mktConfig?.collateralMint ? `/devnet-mint?mint=${mktConfig.collateralMint.toBase58()}&symbol=${encodeURIComponent(symbol)}` : "/devnet-mint"}
+              className="text-[10px] text-[var(--warning)] underline underline-offset-2 hover:text-[var(--warning)]/80"
+            >
               Mint more →
             </a>
           )}
