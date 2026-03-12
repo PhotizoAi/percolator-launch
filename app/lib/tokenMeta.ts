@@ -60,49 +60,64 @@ function getHeliusRpcUrl(connection: Connection): string | null {
  * Fetch token metadata via Helius DAS API (getAsset).
  * Uses the same RPC URL we already have — no extra API key needed.
  */
-async function fetchViaHeliusDAS(
-  rpcUrl: string,
-  mintAddress: string
-): Promise<{ symbol: string; name: string; decimals: number } | null> {
-  try {
-    const res = await fetch(rpcUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        jsonrpc: "2.0",
-        id: `das-${mintAddress}`,
-        method: "getAsset",
-        params: { id: mintAddress, options: { showFungible: true } },
-      }),
-      signal: AbortSignal.timeout(5000),
-    });
+// FIXED CODE
+async function fetchViaHeliusDAS(rpcUrl, mintAddress, maxRetries = 3) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const res = await fetch(rpcUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: `das-${mintAddress}`,
+          method: "getAsset",
+          params: { id: mintAddress, options: { showFungible: true } },
+        }),
+        signal: AbortSignal.timeout(5000),
+      });
 
-    if (!res.ok) return null;
+      // Retry on rate limit or service unavailable
+      if ([429, 503, 504].includes(res.status)) {
+        if (attempt < maxRetries) {
+          const backoffMs = Math.pow(2, attempt - 1) * 100; // 100ms, 200ms, 400ms...
+          await new Promise(r => setTimeout(r, backoffMs));
+          continue; // Try again
+        }
+        return { error: `Helius rate limited (HTTP ${res.status})`, retryable: true };
+      }
 
-    const json = await res.json();
-    const result = json?.result;
-    if (!result) return null;
+      if (!res.ok) {
+        return { error: `Helius failed: HTTP ${res.status}` };
+      }
 
-    // DAS returns content.metadata for NFTs and token_info for fungibles
-    const metadata = result.content?.metadata;
-    const tokenInfo = result.token_info;
+      const json = await res.json();
+      const result = json?.result;
+      if (!result) return null; // Genuinely not found
 
-    const symbol = metadata?.symbol || tokenInfo?.symbol || "";
-    const name = metadata?.name || "";
-    const decimals = tokenInfo?.decimals ?? 6;
+      const metadata = result.content?.metadata;
+      const tokenInfo = result.token_info;
+      const symbol = metadata?.symbol || tokenInfo?.symbol || "";
+      const name = metadata?.name || "";
+      const decimals = tokenInfo?.decimals ?? 6;
 
-    if (symbol && name) {
-      return { symbol, name, decimals };
+      if (symbol && name) {
+        return { symbol, name, decimals }; // Success
+      }
+    } catch (err) {
+      const isNetworkError = err instanceof TypeError || err.name === "AbortError";
+      
+      if (isNetworkError && attempt < maxRetries) {
+        const backoffMs = Math.pow(2, attempt - 1) * 100;
+        await new Promise(r => setTimeout(r, backoffMs));
+        continue;
+      }
+
+      const message = err instanceof Error ? err.message : String(err);
+      return { error: `Network error: ${message}`, retryable: isNetworkError };
     }
-    // Partial match is still useful
-    if (symbol || name) {
-      return { symbol: symbol || shortenMint(mintAddress), name: name || shortenMint(mintAddress), decimals };
-    }
-
-    return null;
-  } catch {
-    return null;
   }
+
+  return { error: `Failed after ${maxRetries} attempts`, retryable: true };
 }
 
 /**
