@@ -49,6 +49,13 @@ export function useStakeDepositByPool({ slabAddress, collateralMint }: StakeDepo
   const [error, setError] = useState<string | null>(null);
   const inflightRef = useRef(false);
 
+   // ===== FIX #1: Reset state when pool selection
+  useEffect(() => {
+    setError(null);
+    setLoading(false);
+    inflightRef.current = false;
+  }, [slabAddress, collateralMint]);
+
   const deposit = useCallback(
     async (amount: bigint) => {
       if (inflightRef.current) throw new Error('Stake deposit already in progress');
